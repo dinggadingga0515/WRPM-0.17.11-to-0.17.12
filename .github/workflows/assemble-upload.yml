@@ -29,7 +29,7 @@ jobs:
               t = p.read_text(encoding="utf-8-sig")
               t = t.replace("\r\n", "\n").replace("\r", "\n")
               chunks.append(t)
-          text = "\n".join(chunks)
+          text = "\n".join(chunks) + "\n"
           data = ("\ufeff" + text.replace("\n", "\r\n")).encode("utf-8")
           out = Path("RP_Manager_0.17.12_RefinerEnhanced_TEST_20261003.txt")
           out.write_bytes(data)
