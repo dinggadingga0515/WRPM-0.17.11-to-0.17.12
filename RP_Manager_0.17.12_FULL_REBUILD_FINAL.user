@@ -28427,6 +28427,42 @@ Existing REF must come from this packet. NEW REF are temporary, and a NEW_P pack
     return { sourceTurns:prefix.map(turn => [String(turn.key),String(turn.text)]), newerTurns:turns.length-job.source.turnCount, currentTurns:turns };
   }
 
+  function assertFullRebuildPartsManifest(data) {
+    const parts = data?.parts;
+    const source = data?.source;
+    const exactKeys = (value, keys) => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).sort().join('|') === [...keys].sort().join('|');
+    if (!Array.isArray(parts) || !parts.length) throw new Error('part manifest가 비어 있습니다.');
+    const total = parts.length;
+    let turnCount = 0;
+    for (const [index, part] of parts.entries()) {
+      if (!exactKeys(part,['index','total','firstTurnKey','lastTurnKey','turnCount','sha256']) ||
+          part.index !== index + 1 || part.total !== total || !Number.isInteger(part.turnCount) || part.turnCount < 1 ||
+          typeof part.firstTurnKey !== 'string' || !part.firstTurnKey || typeof part.lastTurnKey !== 'string' || !part.lastTurnKey ||
+          typeof part.sha256 !== 'string' || !/^[a-f0-9]{64}$/i.test(part.sha256)) {
+        throw new Error('part가 누락·중복되었거나 순서/범위/hash 형식이 다릅니다.');
+      }
+      turnCount += part.turnCount;
+    }
+    if (!source || parts[0].firstTurnKey !== source.firstTurnKey || parts.at(-1).lastTurnKey !== source.lastTurnKey || turnCount !== source.turnCount) {
+      throw new Error('part manifest의 전체 범위 또는 턴 수가 source와 다릅니다.');
+    }
+    return parts;
+  }
+
+  async function assertFullRebuildPartsAgainstSource(data, sourceTurns) {
+    const parts = assertFullRebuildPartsManifest(data);
+    let cursor = 0;
+    for (const part of parts) {
+      const rows = sourceTurns.slice(cursor,cursor + part.turnCount).map(row => [String(row[0]),String(row[1])]);
+      if (rows.length !== part.turnCount || rows[0]?.[0] !== part.firstTurnKey || rows.at(-1)?.[0] !== part.lastTurnKey || await fullRebuildSha256(JSON.stringify(rows)) !== part.sha256) {
+        throw new Error(`${part.index}번 part가 현재 RP 원문의 해당 범위/hash와 다릅니다.`);
+      }
+      cursor += part.turnCount;
+    }
+    if (cursor !== sourceTurns.length) throw new Error('part manifest가 현재 RP 원문 전체를 정확히 덮지 않습니다.');
+    return true;
+  }
+
   function parseFullRebuildJson(raw,job,room) {
     let data;
     try { data = JSON.parse(String(raw || '').replace(/^\uFEFF/,'').trim()); }
@@ -28436,8 +28472,9 @@ Existing REF must come from this packet. NEW REF are temporary, and a NEW_P pack
     const same = (a,b) => JSON.stringify(canonical(a)) === JSON.stringify(canonical(b));
     if (!exact(data,['format','version','source','parts','guides','outputs']) || data.format !== FULL_REBUILD_FORMAT || data.version !== 1) throw new Error('전체 재구축 format/version 또는 최상위 필드가 올바르지 않습니다.');
     if (!exact(data.source,['roomId','chatId','firstTurnKey','lastTurnKey','turnCount','sha256']) || !same(data.source,job.source) || data.source.roomId !== String(room.chatId)) throw new Error('재구축 source/방/원문 hash가 파일 생성 기록과 다릅니다.');
-    if (!Array.isArray(data.parts) || data.parts.length !== job.parts.length || data.parts.some((part,index) => !exact(part,['index','total','firstTurnKey','lastTurnKey','turnCount','sha256']) || !same(part,job.parts[index]))) throw new Error('part가 누락·중복되었거나 순서/범위/hash가 다릅니다.');
-    if (data.parts.some((part,index) => part.index !== index+1 || part.total !== job.parts.length)) throw new Error('PART_INDEX는 1..N을 정확히 한 번씩 포함해야 합니다.');
+    // part 경계는 기존 기억/지침 묶음의 길이에 따라 같은 RP 원문에서도 달라질 수 있다.
+    // 여기서는 내부 완결성을 검사하고, 실제 각 part hash는 fresh source를 읽은 뒤 다시 검증한다.
+    assertFullRebuildPartsManifest(data);
     if (!exact(data.guides,['currentItems','dateLogs','personInfo','timeline','lore']) || !same(data.guides,job.guides)) throw new Error('전문 지침 manifest가 파일 생성 시점과 다릅니다.');
     if (!exact(data.outputs,['currentStateText','importantItemsText','dateLogsText','personInfoText','timelineText','lore'])) throw new Error('여섯 영역의 outputs가 모두 필요합니다.');
     // Output body/schema problems belong to their own domain validator, so a bad
@@ -28746,7 +28783,8 @@ Existing REF must come from this packet. NEW REF are temporary, and a NEW_P pack
       await assertFullRebuildDataSnapshot(room,job,false);
       const manifest = fullRebuildGuides(structuredClone(room)).manifest;
       if (JSON.stringify(manifest) !== JSON.stringify(job.guides) || JSON.stringify(fullRebuildMasterMeta()) !== JSON.stringify(job.master)) throw new Error('재구축 지침이 바뀌었습니다. 파일을 다시 만들어 주세요.');
-      parseFullRebuildJson(raw,job,room);
+      const parsedResult = parseFullRebuildJson(raw,job,room);
+      await assertFullRebuildPartsAgainstSource(parsedResult,sourceState.sourceTurns);
       if (JSON.stringify(room) !== prepared.baseSnapshot) throw new Error('원문 확인 중 저장 데이터가 바뀌었습니다.');
       const candidate = mergeFullRebuildSelections(room,prepared,selected);
       alignFullRebuildCheckpoints(candidate,room,job,sourceState.currentTurns,selected);
@@ -28906,6 +28944,7 @@ Existing REF must come from this packet. NEW REF are temporary, and a NEW_P pack
         await assertFullRebuildDataSnapshot(room,job,true);
         if(JSON.stringify(fullRebuildGuides(structuredClone(room)).manifest)!==JSON.stringify(job.guides)||JSON.stringify(fullRebuildMasterMeta())!==JSON.stringify(job.master))throw new Error('파일 생성 후 지침이 바뀌었습니다. 다시 내보내 주세요.');
         const result=parseFullRebuildJson(input.value,job,room);
+        await assertFullRebuildPartsAgainstSource(result,source.sourceTurns);
         const preparedResult=prepareFullRebuildResult(room,job,result,source.sourceTurns);
         const stored=await readManualStoredRoom(room);
         if(!stored||JSON.stringify(stored)!==JSON.stringify(room))throw new Error('로컬 저장본과 화면 데이터가 다릅니다. 현재 편집을 저장한 뒤 다시 확인해 주세요.');
@@ -37268,7 +37307,7 @@ reason은 각 항목에서 무엇을 줄이거나 합쳤는지와 그 이유를 
     const status=backdrop.querySelector('.rpcm-update-result-status'),diff=backdrop.querySelector('.rpcm-update-diff'),input=backdrop.querySelector('[data-rebuild-json]'),file=backdrop.querySelector('[data-rebuild-file]'),preview=backdrop.querySelector('[data-rebuild-preview]'),apply=backdrop.querySelector('[data-rebuild-apply]');let prepared=null,storedSnapshot='',newerTurns=0,busy=false;
     const guard=()=>state.currentRoom===room&&room.fullRebuildJob?.jobId===job.jobId;const selected=()=>new Set([...diff.querySelectorAll('[data-rebuild-select]:checked')].map(n=>n.dataset.rebuildSelect));const sync=()=>{apply.disabled=!prepared||!selected().size||busy;};const invalidate=()=>{prepared=null;apply.disabled=true;diff.hidden=true;diff.innerHTML='';status.textContent='결과가 바뀌었습니다. 다시 검증해 주세요.';};input.oninput=invalidate;
     file.onchange=async()=>{const chosen=file.files?.[0];if(!chosen)return;try{if(!/\.json$/i.test(chosen.name)||chosen.size>8000000)throw new Error('8MB 이하 UTF-8 .json 파일을 선택해 주세요.');input.value=new TextDecoder('utf-8',{fatal:true}).decode(await chosen.arrayBuffer());invalidate();status.textContent=`${chosen.name} 읽음 · 검증을 눌러 주세요.`;}catch(error){status.textContent='파일 읽기 실패: '+error.message;}file.value='';};diff.onchange=e=>{if(e.target.matches('[data-rebuild-select]'))sync();};diff.onclick=e=>{const b=e.target.closest('[data-rebuild-select-all]');if(!b)return;for(const box of diff.querySelectorAll('[data-rebuild-select]'))box.checked=b.dataset.rebuildSelectAll==='all';sync();};
-    const runPreview=async(rawOverride=null)=>{if(busy)return;if(rawOverride!==null){input.value=String(rawOverride);invalidate();}if(rpcmExternalBusy('full'))return rpcmOpenImportHold(room,'전체 재구축 JSON',input.value,kept=>runPreview(kept),guard);busy=true;preview.disabled=true;apply.disabled=true;status.textContent='전체 RP source·part·지침을 검증하고 각 영역을 따로 확인하는 중…';try{let result;try{result=parseFullRebuildJson(input.value,job,room);}catch(error){if(rpcmImportErrorRepairable(error)&&rpcmOpenJsonRepair(room,'전체 재구축 JSON',input.value,kept=>runPreview(kept),guard)){status.textContent='JSON 형식 오류 · 수정창에서 고친 뒤 재검증하세요.';return;}throw error;}const source=await assertFullRebuildSource(room,job);await assertFullRebuildDataSnapshot(room,job,true);if(JSON.stringify(fullRebuildGuides(structuredClone(room)).manifest)!==JSON.stringify(job.guides)||JSON.stringify(fullRebuildMasterMeta())!==JSON.stringify(job.master))throw new Error('파일 생성 후 지침이 바뀌었습니다. 다시 내보내 주세요.');const preparedResult=prepareFullRebuildResult(room,job,result,source.sourceTurns),stored=await readManualStoredRoom(room);if(!stored||JSON.stringify(stored)!==JSON.stringify(room))throw new Error('로컬 저장본과 화면 데이터가 다릅니다. 현재 편집을 저장한 뒤 다시 확인해 주세요.');storedSnapshot=JSON.stringify(stored);prepared=preparedResult;newerTurns=source.newerTurns;for(const {key} of FULL_REBUILD_DOMAINS)if(!prepared.domains[key].valid)recordRpcmIssue(room,'FULL_REBUILD','domain-validation',key==='lore'&&/REF/.test(prepared.domains[key].error)?'LORE_REF_INVALID':'DOMAIN_INVALID',`${prepared.domains[key].label} 검증 실패`,prepared.domains[key].error);const warning=newerTurns?`<p class="rpcm-full-rebuild-warning">이 결과는 현재 최신 RP보다 ${newerTurns}턴 이전 snapshot 기준입니다. 적용 후 개별 업데이트에서 새 턴을 이어서 처리해야 합니다.</p>`:'';const invalid=FULL_REBUILD_DOMAINS.filter(({key})=>!prepared.domains[key].valid).length;diff.innerHTML=`${warning}<div class="rpcm-rebuild-diff-toolbar"><strong>검증 결과 · 정상 ${5-invalid}영역${invalid?` · 검증 실패 ${invalid}영역`:''}</strong><div><button type="button" class="rpcm-btn secondary" data-rebuild-select-all="all">전체 선택</button><button type="button" class="rpcm-btn secondary" data-rebuild-select-all="none">전체 해제</button></div></div>${fullRebuildDiffCardsHtml(prepared,room)}`;diff.hidden=false;status.textContent=invalid?'영역 오류는 해당 영역만 반영할 수 없습니다. 정상 영역의 Diff를 확인해 선택하세요.':'검증 완료 · 각 영역의 Diff를 확인하고 반영할 영역을 선택하세요.';}catch(error){prepared=null;diff.hidden=true;status.textContent='전체 재구축 결과 적용 불가: '+error.message;recordRpcmIssue(room,'FULL_REBUILD','global-validation','GLOBAL_INVALID','전체 재구축 결과 적용 불가',error.message);}finally{busy=false;preview.disabled=false;sync();}};
+    const runPreview=async(rawOverride=null)=>{if(busy)return;if(rawOverride!==null){input.value=String(rawOverride);invalidate();}if(rpcmExternalBusy('full'))return rpcmOpenImportHold(room,'전체 재구축 JSON',input.value,kept=>runPreview(kept),guard);busy=true;preview.disabled=true;apply.disabled=true;status.textContent='전체 RP source·part·지침을 검증하고 각 영역을 따로 확인하는 중…';try{let result;try{result=parseFullRebuildJson(input.value,job,room);}catch(error){if(rpcmImportErrorRepairable(error)&&rpcmOpenJsonRepair(room,'전체 재구축 JSON',input.value,kept=>runPreview(kept),guard)){status.textContent='JSON 형식 오류 · 수정창에서 고친 뒤 재검증하세요.';return;}throw error;}const source=await assertFullRebuildSource(room,job);await assertFullRebuildPartsAgainstSource(result,source.sourceTurns);await assertFullRebuildDataSnapshot(room,job,true);if(JSON.stringify(fullRebuildGuides(structuredClone(room)).manifest)!==JSON.stringify(job.guides)||JSON.stringify(fullRebuildMasterMeta())!==JSON.stringify(job.master))throw new Error('파일 생성 후 지침이 바뀌었습니다. 다시 내보내 주세요.');const preparedResult=prepareFullRebuildResult(room,job,result,source.sourceTurns),stored=await readManualStoredRoom(room);if(!stored||JSON.stringify(stored)!==JSON.stringify(room))throw new Error('로컬 저장본과 화면 데이터가 다릅니다. 현재 편집을 저장한 뒤 다시 확인해 주세요.');storedSnapshot=JSON.stringify(stored);prepared=preparedResult;newerTurns=source.newerTurns;for(const {key} of FULL_REBUILD_DOMAINS)if(!prepared.domains[key].valid)recordRpcmIssue(room,'FULL_REBUILD','domain-validation',key==='lore'&&/REF/.test(prepared.domains[key].error)?'LORE_REF_INVALID':'DOMAIN_INVALID',`${prepared.domains[key].label} 검증 실패`,prepared.domains[key].error);const warning=newerTurns?`<p class="rpcm-full-rebuild-warning">이 결과는 현재 최신 RP보다 ${newerTurns}턴 이전 snapshot 기준입니다. 적용 후 개별 업데이트에서 새 턴을 이어서 처리해야 합니다.</p>`:'';const invalid=FULL_REBUILD_DOMAINS.filter(({key})=>!prepared.domains[key].valid).length;diff.innerHTML=`${warning}<div class="rpcm-rebuild-diff-toolbar"><strong>검증 결과 · 정상 ${5-invalid}영역${invalid?` · 검증 실패 ${invalid}영역`:''}</strong><div><button type="button" class="rpcm-btn secondary" data-rebuild-select-all="all">전체 선택</button><button type="button" class="rpcm-btn secondary" data-rebuild-select-all="none">전체 해제</button></div></div>${fullRebuildDiffCardsHtml(prepared,room)}`;diff.hidden=false;status.textContent=invalid?'영역 오류는 해당 영역만 반영할 수 없습니다. 정상 영역의 Diff를 확인해 선택하세요.':'검증 완료 · 각 영역의 Diff를 확인하고 반영할 영역을 선택하세요.';}catch(error){prepared=null;diff.hidden=true;status.textContent='전체 재구축 결과 적용 불가: '+error.message;recordRpcmIssue(room,'FULL_REBUILD','global-validation','GLOBAL_INVALID','전체 재구축 결과 적용 불가',error.message);}finally{busy=false;preview.disabled=false;sync();}};
     preview.onclick=()=>runPreview();apply.onclick=async()=>{if(!prepared||busy)return;const selection=selected();if(!selection.size)return;const labels=FULL_REBUILD_DOMAINS.filter(({key})=>selection.has(key)).map(d=>d.label);if(!confirm(`전체 기억 재구축 중 다음 영역만 반영할까요?\n${labels.join(' · ')}${newerTurns?`\n주의: 최신 RP ${newerTurns}턴은 이 결과에 없습니다.`:''}\n\n선택하지 않은 영역과 체크포인트는 유지합니다. 적용 전 백업 파일을 다운로드합니다.`))return;busy=true;apply.disabled=true;preview.disabled=true;status.textContent='원문·저장본 재확인 → 백업 → 선택 영역 저장 → 저장본 재검증 중…';try{const result=await commitFullRebuildResult(room,job,prepared,input.value,storedSnapshot,selection);status.textContent=`로컬 저장 검증 완료 · ${labels.join(' · ')} 반영 · ${result.carrier}${result.newerTurns?` · 최신 ${result.newerTurns}턴 미반영`:''}`;status.classList.add('is-saved');renderModalIfOpen();notify(`전체 기억 재구축 선택 영역 저장 완료 · ${result.carrier}`,'success',7000);}catch(error){status.textContent='저장 실패 · 적용 상태를 확인해 주세요: '+error.message;recordRpcmIssue(room,'FULL_REBUILD','commit','COMMIT_FAILED','선택 영역 저장 실패',error.message);apply.disabled=false;preview.disabled=false;}finally{busy=false;}};
     backdrop.querySelectorAll('.rpcm-update-dialog-close').forEach(b=>b.onclick=()=>backdrop.remove());backdrop.onclick=e=>{if(e.target===backdrop)backdrop.remove();};backdrop.onkeydown=e=>{if(e.key==='Escape'&&!busy)backdrop.remove();};document.body.appendChild(backdrop);
   };
