@@ -1,0 +1,48 @@
+name: Assemble WRPM large TXT
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.upload_parts/READY'
+
+permissions:
+  contents: write
+
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Assemble and verify
+        shell: python
+        run: |
+          from pathlib import Path
+          import hashlib, shutil
+          part_dir = Path(".upload_parts")
+          parts = sorted(part_dir.glob("part-*.txt"))
+          if not parts:
+              raise SystemExit("no parts")
+          chunks = []
+          for p in parts:
+              t = p.read_text(encoding="utf-8-sig")
+              t = t.replace("\r\n", "\n").replace("\r", "\n")
+              chunks.append(t)
+          text = "\n".join(chunks)
+          data = ("\ufeff" + text.replace("\n", "\r\n")).encode("utf-8")
+          out = Path("RP_Manager_0.17.12_RefinerEnhanced_TEST_20261003.txt")
+          out.write_bytes(data)
+          sha = hashlib.sha256(data).hexdigest()
+          expected = "c17e08d00fafaf6aa96048b086f17572d38548b1a3fed66a8d57e62bf52381d0"
+          if sha != expected:
+              raise SystemExit(f"SHA mismatch: {sha} != {expected}")
+          shutil.rmtree(part_dir)
+          Path(".github/workflows/assemble-upload.yml").unlink()
+      - name: Commit assembled file
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Add RP Manager 0.17.12 patched reference [skip assemble]"
+          git push
