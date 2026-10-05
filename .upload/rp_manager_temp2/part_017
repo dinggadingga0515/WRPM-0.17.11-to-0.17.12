@@ -1,0 +1,1000 @@
+          // 이전/빈 인증정보를 사용해 Firebase 설정 오류가 날 수 있습니다.
+          if (changed) {
+            for (const id of AI_SUMMARY_PROVIDERS) draftSecrets.set(id, readAiSecret(id));
+            dirty = true;
+          }
+          render();
+          return;
+        }
+        if (action === 'close-settings') { settingsOpen = false; render(); return; }
+        if (action === 'update') { mode = 'api-update'; apiSections.add('range'); apiSections.add('result'); render(); await refreshReviewSnapshot(); return; }
+        if (action === 'audit') { mode = 'audit'; preview = null; previewRun = null; auditDraft = null; apiStatus = ''; render(); await refreshReviewSnapshot(); return; }
+        if (action === 'return-update') { mode = 'api-update'; preview = null; previewRun = null; previewFilter = 'changed'; render(); return; }
+        if (action === 'return-audit') { mode = 'audit'; preview = null; previewRun = null; previewFilter = 'changed'; render(); return; }
+        if (action === 'toggle-api-section') { captureApiForm(false); const id = String(button.dataset.storySection || ''); if (apiSections.has(id)) apiSections.delete(id); else apiSections.add(id); render(); return; }
+        if (action === 'toggle-month') { const section = button.closest('.rpcm-story-month'); if (!section) return; section.classList.toggle('is-open'); button.querySelector('span').textContent = `${section.classList.contains('is-open') ? '▾' : '▸'} ${button.querySelector('span').textContent.replace(/^[▾▸]\s*/, '')}`; return; }
+        if (action === 'preview-changed') { previewFilter = 'changed'; render(); return; }
+        if (action === 'preview-all') { previewFilter = 'all'; render(); return; }
+        if (action === 'clear-diff') { room.storyTimelineLastDiff = []; dirty = true; render(); return; }
+        if (action === 'scroll-card') {
+          const id = String(button.dataset.storyScrollId || '');
+          const target = backdrop.querySelector(`[data-story-read-id="${typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(id) : id}"]`);
+          target?.closest('details')?.setAttribute('open', '');
+          target?.scrollIntoView({ behavior:'smooth', block:'start' });
+          return;
+        }
+        if (action === 'restore-backup') {
+          const backup = room.storyTimelineBackup;
+          const savedWhen = backup?.savedAt ? new Date(backup.savedAt).toLocaleString('ko-KR') : '알 수 없음';
+          if (!backup || !confirm(`직전 타임라인으로 되돌릴까요?\n\n저장 시각: ${savedWhen}\n사유: ${backup.reason || '변경 전'}\n\n현재 타임라인은 다시 되돌릴 수 있도록 교체 백업됩니다.`)) return;
+          restoreStoryTimelineBackup(room); room.storyTimelineLastDiff = []; dirty = true; render(); notify('직전 타임라인으로 되돌렸습니다.', 'success'); return;
+        }
+        if (action === 'delete-card') {
+          const cardId = String(button.closest('[data-story-read-id]')?.dataset.storyReadId || '');
+          const card = cards().find(item => String(item.cardId) === cardId);
+          if (!card || !confirm(`‘${card.title || '제목 없는 카드'}’ 카드를 삭제할까요?`)) return;
+          backupStoryTimeline(room, '카드 삭제 전');
+          room.storyTimelineCards = room.storyTimelineCards.filter(item => String(item.cardId) !== cardId);
+          dirty = true; render(); return;
+        }
+        if (action === 'copy-guide') {
+          try { await copyPlainText(externalChatTitleInstruction('timeline')+'\n\n'+(backdrop.querySelector('#rpcm-story-guide-text')?.value || effectiveTimelineGuide(room))); notify('타임라인 지침을 복사했습니다.', 'success'); } catch (error) { notify(`복사 실패: ${error.message}`, 'error'); }
+          return;
+        }
+        if (action === 'copy-update-prompt') {
+          if (!reviewSnapshot) { notify('RP 검토 범위를 먼저 확인해 주세요.', 'warn'); return; }
+          const existingRun = room.storyTimelineManualRun;
+          const currentSignature = storyTimelineMasterSignature(snapshotStoryTimelineCardsForLabel(room, activeLabel));
+          const reusable = existingRun?.runId && String(existingRun.timelineLabel) === String(activeLabel) && String(existingRun.masterSignature || '') === currentSignature && String(existingRun.kind) === String(updateMode);
+          if (existingRun?.runId && !reusable && !confirm('저장된 미완료 수동 REF 작업이 있습니다. 새 갱신 작업으로 교체할까요?')) return;
+          const run = reusable ? existingRun : createStoryTimelineRun(room, activeLabel, updateMode, 'FULL');
+          room.storyTimelineManualRun = run;
+          const prompt = buildStoryTimelineUpdatePrompt(room, updateMode, selectedUnreviewedLogs(), reviewSnapshot, run);
+          try { await copyPlainText(prompt); dirty = true; await saveRoom(room); notify('REF가 포함된 외부 GPT용 갱신 프롬프트를 복사했습니다.', 'success'); }
+          catch (error) { notify(`복사 실패: ${error.message}`, 'error'); }
+          return;
+        }
+        if (action === 'copy-audit-prompt') {
+          const requested = auditScope === 'TIMELINE_ONLY' ? 'TIMELINE_ONLY' : 'FULL';
+          const effective = requested === 'TIMELINE_ONLY' ? 'TIMELINE_ONLY' : (reviewSnapshot?.historyLimitReached ? 'PARTIAL' : 'FULL');
+          if (requested === 'FULL' && !reviewSnapshot) { notify('전체 RP 근거를 먼저 확인해 주세요.', 'warn'); return; }
+          const existingRun = room.storyTimelineManualRun;
+          const currentSignature = storyTimelineMasterSignature(snapshotStoryTimelineCardsForLabel(room, activeLabel));
+          const reusable = existingRun?.runId && existingRun.kind === 'audit' && String(existingRun.timelineLabel) === String(activeLabel) && String(existingRun.masterSignature || '') === currentSignature && existingRun.sourceScope === effective;
+          if (existingRun?.runId && !reusable && !confirm('저장된 미완료 수동 REF 작업이 있습니다. 새 점검 작업으로 교체할까요?')) return;
+          const run = reusable ? existingRun : createStoryTimelineRun(room, activeLabel, 'audit', effective);
+          room.storyTimelineManualRun = run;
+          try { await copyPlainText(buildStoryTimelineAuditManualPrompt(room, run, reviewSnapshot, effective)); dirty = true; await saveRoom(room); notify('외부 GPT용 점검 프롬프트를 복사했습니다.', 'success'); }
+          catch (error) { notify(`복사 실패: ${error.message}`, 'error'); }
+          return;
+        }
+        if (action === 'reset-guide') {
+          if (!confirm('타임라인 지침을 기본 v1.7.2로 되돌릴까요? 저장 전에는 취소할 수 있습니다.')) return;
+          backdrop.querySelector('#rpcm-story-guide-text').value = canonicalGuideText('timeline'); return;
+        }
+        if (action === 'save-guide') {
+          room.storyTimelineGuide = String(backdrop.querySelector('#rpcm-story-guide-text')?.value || '') || canonicalGuideText('timeline');
+          room.storyTimelineGuideSource = room.storyTimelineGuide === canonicalGuideText('timeline') ? 'builtin-v1.7.2' : 'custom';
+          room.storyTimelineGuideRevisionV15 = true;
+          dirty = true; mode = guideReturnMode; render(); notify('타임라인 지침을 저장했습니다.', 'success'); return;
+        }
+        if (action === 'save-settings') {
+          room.storyTimelineReviewSettings = { threshold:Math.max(1, Math.min(1000, Number(backdrop.querySelector('#rpcm-story-threshold')?.value) || 50)), menuBadge:!!backdrop.querySelector('#rpcm-story-menu-badge')?.checked, topNotice:!!backdrop.querySelector('#rpcm-story-top-notice')?.checked, popup:!!backdrop.querySelector('#rpcm-story-popup')?.checked, dateIndicator:!!backdrop.querySelector('#rpcm-story-date-indicator')?.checked, monthlyFold:!!backdrop.querySelector('#rpcm-story-monthly-fold')?.checked, monthlyFoldMin:Math.max(2, Math.min(100, Number(backdrop.querySelector('#rpcm-story-monthly-min')?.value) || 8)) };
+          dirty = true; settingsOpen = false; render(); notify('타임라인 설정을 저장했습니다.', 'success'); return;
+        }
+        if (action === 'save-api-settings') { captureApiForm(true); apiStatus = 'API 연결 설정을 저장했습니다.'; render(); return; }
+        if (action === 'test-api') {
+          try {
+            const next = captureApiForm(true); apiBusy = true; apiStatus = '연결 테스트 중…'; render();
+            const result = await callAiSummaryProvider(next.provider, next, readAiSecret(next.provider), '짧게 응답하세요.', '연결 테스트입니다. 정확히 OK만 출력하세요.', 64, message => { apiStatus = message; render(); }, { feature:'timeline', room });
+            apiStatus = `연결 성공 · ${result.model} · 입력 ${formatCount(result.usage?.inputTokens || 0)} / 출력 ${formatCount(result.usage?.outputTokens || 0)} tokens`;
+          } catch (error) { apiStatus = `연결 실패 · ${friendlyAiErrorMessage(error)}`; }
+          apiBusy = false; render(); return;
+        }
+        if (action === 'load-api-history') {
+          const item = (room.storyTimelineApiHistory || []).find(entry => String(entry.id || '') === String(button.dataset.storyHistoryId || ''));
+          if (!item) return;
+          apiDraft = item; room.storyTimelineApiDraft = item; resultText = String(item.finalText || item.rawResult || ''); preview = null; previewRun = null; updateMode = item.updateMode === 'rebuild' ? 'rebuild' : 'continue'; apiSections.add('result'); render(); return;
+        }
+        if (action === 'api-generate') {
+          if (!reviewSnapshot) { notify('RP 검토 범위를 확인한 뒤 다시 눌러 주세요.', 'warn'); return; }
+          try {
+            const next = captureApiForm(true);
+            const selectedLogs = selectedUnreviewedLogs();
+            apiBusy = true; apiStatus = '타임라인 생성 준비 중…'; render();
+            apiDraft = await generateStoryTimelineApiDraft(room, next, readAiSecret(next.provider), updateMode, reviewSnapshot, selectedLogs, message => { apiStatus = message; render(); });
+            setAiFeatureStatus('timeline', 'ok', next.provider, apiDraft.model, '최근 생성 정상');
+            room.storyTimelineApiDraft = apiDraft;
+            room.storyTimelineApiHistory = [apiDraft, ...(room.storyTimelineApiHistory || []).filter(item => String(item.id) !== String(apiDraft.id))].slice(0, 10);
+            resultText = apiDraft.finalText;
+            preview = null;
+            previewRun = null;
+            apiStatus = apiDraft.noChange ? '검토 완료 · 타임라인 변경 없음' : `생성 완료 · ${apiDraft.usage.calls}회 호출 · ${formatAiCostUsd(apiDraft.usage.estimatedCostUsd)}`;
+            apiSections.add('result'); dirty = true; await saveRoom(room);
+          } catch (error) { const failure = classifyAiFailure(error); setAiFeatureStatus('timeline', 'error', apiSettings.provider, apiSettings.models?.[apiSettings.provider] || '', failure.category, failure.detail); apiStatus = `생성 실패 · ${failure.category} · ${friendlyAiErrorMessage(error)}`; }
+          apiBusy = false; render(); return;
+        }
+        if (action === 'audit-generate') {
+          const requested = auditScope === 'TIMELINE_ONLY' ? 'TIMELINE_ONLY' : 'FULL';
+          if (requested === 'FULL' && !reviewSnapshot) { notify('전체 RP 근거를 확인하지 못했습니다.', 'warn'); return; }
+          try {
+            const next = captureApiForm(true);
+            apiBusy = true; apiStatus = '타임라인 독립 점검 준비 중…'; render();
+            auditDraft = await generateStoryTimelineAuditDraft(room, next, readAiSecret(next.provider), reviewSnapshot, requested, message => { apiStatus = message; render(); });
+            auditResultText = auditDraft.rawResult || '';
+            apiStatus = `점검 완료 · ${auditDraft.audit.result} · ${auditDraft.usage.calls}회 호출 · ${formatAiCostUsd(auditDraft.usage.estimatedCostUsd)}`;
+            dirty = true; await saveRoom(room);
+            if (auditDraft.audit.result === 'FAIL') { preview = auditDraft.preview; mode = 'audit-preview'; }
+          } catch (error) {
+            const excerpt = error.rawExcerpt ? `\n응답 일부: ${error.rawExcerpt}` : '';
+            apiStatus = `점검 실패 · ${friendlyAiErrorMessage(error)}${excerpt}`;
+          }
+          apiBusy = false; render(); return;
+        }
+        if (action === 'audit-parse') {
+          try {
+            auditResultText = String(backdrop.querySelector('#rpcm-story-audit-text')?.value || auditResultText || '');
+            const run = room.storyTimelineManualRun;
+            if (!run || run.kind !== 'audit' || String(run.timelineLabel) !== String(activeLabel)) throw new Error('이 결과에 대응하는 수동 점검 REF 작업이 없습니다. 먼저 점검 프롬프트를 복사해 주세요.');
+            const expected = run.sourceScope || (auditScope === 'TIMELINE_ONLY' ? 'TIMELINE_ONLY' : 'FULL');
+            const parsedAudit = /^\s*\{/.test(auditResultText) ? parseStoryTimelineAuditJson(auditResultText, room, run, expected) : parseStoryTimelineAuditManual(auditResultText, room, run, expected);
+            auditDraft = { id:run.runId, createdAt:nowIso(), provider:'external', model:'외부 GPT', run, audit:parsedAudit.audit, preview:parsedAudit.preview, usage:{ calls:0, inputTokens:0, outputTokens:0, estimatedCostUsd:0 }, rawResult:auditResultText };
+            addStoryTimelineAuditHistory(room, auditDraft); dirty = true; await saveRoom(room);
+            if (auditDraft.audit.result === 'FAIL') { preview = auditDraft.preview; mode = 'audit-preview'; }
+            else apiStatus = `점검 결과 · ${auditDraft.audit.result} · 타임라인은 변경하지 않았습니다.`;
+            render();
+          } catch (error) { notify(`점검 결과 확인 실패: ${error.message}`, 'error', 7000); }
+          return;
+        }
+        if (action === 'set-baseline') {
+          const warning = reviewSnapshot?.anchorInvalid
+            ? `기존 타임라인이 현재 RP까지 이미 반영되어 있을 때만 진행하세요.\n\n현재 위치를 새 검토 기준으로 설정하면 지금까지의 RP는 새 갱신 범위에 다시 포함되지 않습니다. 미반영 RP가 남아 있다면 취소하고 ‘전체 다시 읽기’를 선택하세요.`
+            : `기존 타임라인이 현재 RP까지 이미 반영되어 있나요?\n\n현재까지 ${reviewSnapshot?.turns?.length || 0}턴을 검토 완료 기준으로 잡고 새 RP부터 계산합니다.`;
+          if (!reviewSnapshot?.latestKey || !confirm(warning)) return;
+          room.storyTimelineLastReviewedMessageId = reviewSnapshot.latestKey; room.storyTimelineLastReviewedAt = nowIso(); room.storyTimelineUnreviewedTurnCount = 0; dirty = true;
+          await saveRoom(room); await refreshReviewSnapshot(); notify('현재 RP를 타임라인 검토 기준점으로 설정했습니다.', 'success'); return;
+        }
+        if (action === 'recover-with-rebuild') {
+          updateMode = 'rebuild';
+          reviewError = '';
+          apiSections.add('range');
+          render();
+          await refreshReviewSnapshot();
+          return;
+        }
+        if (action === 'complete-no-change') {
+          if (!stageCurrentReviewScope()) { notify('검토 범위를 확인한 뒤 다시 눌러 주세요.', 'warn'); return; }
+          const pending = room.storyTimelinePendingReview;
+          const newLogs = (pending.logs || []).length;
+          if (!confirm(`타임라인 변경 없이 검토 완료할까요?\n\nRP ${Number(pending.turnCount || 0)}턴\n날짜로그 ${newLogs}개\n\n타임라인 내용은 변경되지 않습니다.`)) return;
+          markStoryReviewCompleted(room); room.storyTimelineUnreviewedTurnCount = 0; room.storyTimelineCarryoverTurnKeys = (pending.reviewedTailKeys || []).map(String).slice(-40); room.storyTimelineApiDraft = null; dirty = true; finish(true); return;
+        }
+        if (action === 'edit') {
+          backdrop.remove();
+          const edited = await openStoryTimelineEditorDialog(room);
+          if (edited === true) dirty = true;
+          document.body.appendChild(backdrop); mode = 'view'; render(); return;
+        }
+        if (action === 'edit-preview') {
+          if (!preview) return;
+          const returnMode = mode;
+          const run = returnMode === 'audit-preview' ? auditDraft?.run : (previewRun || room.storyTimelineManualRun || createStoryTimelineRun(room, activeLabel, 'manual-edit', 'FULL'));
+          const temporaryRoom = { ...room, activeLogTimeline:activeLabel, storyTimelineCards:(preview.cards || []).map(card => ({ ...card, timelineLabel:activeLabel, tags:[...(card.tags || [])] })), storyTimelineBackup:null };
+          backdrop.remove();
+          const edited = await openStoryTimelineEditorDialog(temporaryRoom);
+          document.body.appendChild(backdrop);
+          if (edited === true) {
+            preview = buildStoryTimelinePreview(snapshotStoryTimelineCardsForLabel(temporaryRoom, activeLabel), run);
+            if (returnMode === 'audit-preview' && auditDraft) auditDraft.preview = preview;
+            dirty = true;
+          }
+          mode = returnMode; render(); return;
+        }
+        if (action === 'parse') {
+          try {
+            resultText = String(backdrop.querySelector('#rpcm-story-paste-text')?.value || '');
+            if (/^타임라인\s*변경\s*없음\s*$/.test(resultText.trim())) { notify('변경 없음 결과입니다. “변경 없음 · 검토 완료”를 눌러 주세요.', 'info', 4200); return; }
+            const importOptions = apiImportOptionsFor(resultText);
+            preview = parseStoryTimelineImport(resultText, room, importOptions);
+            previewRun = importOptions.run || null;
+            mode = 'preview'; render();
+          }
+          catch (error) { previewRun = null; notify(`타임라인 결과 확인 실패: ${error.message}`, 'error', 6500); }
+          return;
+        }
+        if (action === 'save-result') {
+          const savingAudit = mode === 'audit-preview';
+          if (!preview) {
+            try {
+              resultText = String(backdrop.querySelector('#rpcm-story-paste-text')?.value || resultText || '');
+              if (/^타임라인\s*변경\s*없음\s*$/.test(resultText.trim())) { notify('변경이 없다면 “변경 없음 · 검토 완료”를 눌러 주세요.', 'info', 4200); return; }
+              const importOptions = apiImportOptionsFor(resultText);
+              preview = parseStoryTimelineImport(resultText, room, importOptions);
+              previewRun = importOptions.run || null;
+            } catch (error) { previewRun = null; notify(`타임라인 저장 실패: ${error.message}`, 'error', 6500); return; }
+          }
+          const summary = diffSummary(preview.diff);
+          if (!confirm(`현재 결과를 최신 전체 타임라인으로 저장할까요?\n\n${summary}\n전체 카드 ${cards().length} → ${preview.cards.length}`)) return;
+          const run = savingAudit ? auditDraft?.run : previewRun;
+          if (run) {
+            try { assertStoryTimelineRunCurrent(room, run); }
+            catch (error) { notify(error.message, 'error', 7000); return; }
+          }
+          backupStoryTimeline(room, savingAudit ? '타임라인 점검 수정본 적용 전' : 'GPT 타임라인 적용 전');
+          if (run) applyStoryTimelinePreviewForRun(room, run, preview);
+          else {
+            const key = normalizedLogTimelineKey(activeLabel === DEFAULT_LOG_TIMELINE ? '' : activeLabel);
+            const others = normalizeStoryTimelineCards(room).filter(card => normalizedLogTimelineKey((card.timelineLabel || DEFAULT_LOG_TIMELINE) === DEFAULT_LOG_TIMELINE ? '' : card.timelineLabel) !== key);
+            room.storyTimelineCards = [...others, ...preview.cards.map(card => ({ ...card, timelineLabel:activeLabel }))]; normalizeStoryTimelineCards(room);
+          }
+          room.storyTimelineLastDiff = preview.diff || [];
+          let hadPendingReview = false;
+          let completedScope = null;
+          if (savingAudit) {
+            if (auditMarkReviewed && reviewSnapshot?.latestKey && auditDraft?.audit?.sourceScope === 'FULL') {
+              room.storyTimelinePendingReview = storyTimelineReviewScopeFromSnapshot(reviewSnapshot, [], 'rebuild', (reviewSnapshot.allTurns || []).slice(-40).map(turn => turn.key));
+              completedScope = room.storyTimelinePendingReview; hadPendingReview = true; markStoryReviewCompleted(room);
+              room.storyTimelineUnreviewedTurnCount = 0;
+            }
+          } else {
+            hadPendingReview = stageCurrentReviewScope() || !!room.storyTimelinePendingReview;
+            completedScope = room.storyTimelinePendingReview; markStoryReviewCompleted(room);
+          }
+          room.storyTimelineCarryoverTurnKeys = (completedScope?.reviewedTailKeys || apiDraft?.reviewScope?.reviewedTailKeys || room.storyTimelineCarryoverTurnKeys || []).map(String).slice(-40);
+          room.storyTimelineApiDraft = null;
+          previewRun = null;
+          if (room.storyTimelineManualRun?.runId === run?.runId) room.storyTimelineManualRun = null;
+          if (hadPendingReview) room.storyTimelineUnreviewedTurnCount = 0;
+          await saveRoom(room);
+          dirty = true; finish(true); return;
+        }
+      }, true);
+      backdrop.addEventListener('change', event => {
+        if (event.target?.id === 'rpcm-story-audit-scope') {
+          auditScope = event.target.value === 'TIMELINE_ONLY' ? 'TIMELINE_ONLY' : 'FULL';
+          auditDraft = null; auditResultText = ''; apiStatus = ''; render(); return;
+        }
+        if (event.target?.id === 'rpcm-story-audit-reviewed') {
+          auditMarkReviewed = !!event.target.checked; return;
+        }
+        if (mode !== 'api-update') return;
+        if (event.target?.matches?.('[data-story-log-id]')) {
+          const logId = String(event.target.dataset.storyLogId || '');
+          if (event.target.checked) selectedStoryLogIds.add(logId); else selectedStoryLogIds.delete(logId);
+          captureApiForm(false);
+          render();
+          return;
+        }
+        if (event.target?.id === 'rpcm-story-api-provider') {
+          const oldProvider = apiSettings.provider;
+          const oldModel = backdrop.querySelector('#rpcm-story-api-model');
+          const oldSecret = backdrop.querySelector('#rpcm-story-api-secret');
+          const result = backdrop.querySelector('#rpcm-story-paste-text');
+          if (result) resultText = result.value;
+          if (oldModel) apiSettings.models[oldProvider] = String(oldModel.value || '').trim();
+          if (oldSecret) draftSecrets.set(oldProvider, oldSecret.value);
+          apiSettings.provider = AI_SUMMARY_PROVIDERS.includes(event.target.value) ? event.target.value : 'gemini';
+          apiSections.add('connection');
+          render();
+          return;
+        }
+        if (event.target?.id === 'rpcm-story-update-mode') {
+          captureApiForm(false);
+          updateMode = event.target.value === 'rebuild' ? 'rebuild' : 'continue';
+          render();
+          refreshReviewSnapshot();
+        }
+      });
+      backdrop.onkeydown = event => {
+        if (event.key !== 'Escape') return;
+        if (helpOpen || settingsOpen) { helpOpen = false; settingsOpen = false; render(); return; }
+        if (mode !== 'view') { captureApiForm(false); mode = 'view'; preview = null; previewRun = null; render(); return; }
+        finish(dirty);
+      };
+      document.body.appendChild(backdrop);
+      render();
+      if (mode === 'api-update' || mode === 'audit') void refreshReviewSnapshot();
+    });
+  }
+
+  const loreBudgetInfoCache = new WeakMap();
+  function loreBudgetInfoFor(room) { return room && typeof room === 'object' ? loreBudgetInfoCache.get(room) || room._loreBudgetInfo || null : null; }
+  const LORE_INJECTION_CHAR_LIMIT = 6000;
+  const LORE_INJECTION_CARD_LIMIT = 10;
+  const LORE_TYPES = ['장소','조직','세계관','규칙·제도','물건·장비 설정','개념','사건·용어','기타','복장','핵심 대사'];
+  const LORE_TYPE_ORDER = ['물건·장비 설정','세계관','복장','장소','조직','규칙·제도','개념','사건·용어','핵심 대사','기타'];
+  const LORE_MODES = ['off','manual','always','auto'];
+  const LORE_NEW_CARD_DEFAULTS = Object.freeze({mode:'auto', enabled:true, manualSelected:false});
+
+  function makeLoreId(kind) {
+    return `${kind}-${globalThis.crypto?.randomUUID?.() || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`}`;
+  }
+
+  function lorePacksFor(room) {
+    return Array.isArray(room?.lorePacks) ? room.lorePacks : [];
+  }
+
+  // Missing metadata is interpreted conservatively at runtime; old rooms are not rewritten.
+  function lorePackManagedBy(pack) {
+    return pack?.managedBy === 'ai' && !pack?.copiedFrom ? 'ai' : 'user';
+  }
+  function loreCardManagedBy(card, pack) {
+    return card?.managedBy === 'ai' && lorePackManagedBy(pack) === 'ai' && !card?.copiedFrom && card?.source !== 'manual-legacy-lore' ? 'ai' : 'user';
+  }
+  function loreCardUserLocked(card, pack) {
+    return loreCardManagedBy(card, pack) !== 'ai' || card.userLocked !== false;
+  }
+  function loreCardContentFields(card) {
+    const full = String(card?.full ?? card?.content ?? '').trim();
+    const compact = String(card?.compact ?? card?.summary ?? '').trim();
+    return {
+      title:String(card?.title || '').trim(), type:String(card?.type || ''),
+      aliases:Array.isArray(card?.aliases) ? [...card.aliases] : [],
+      triggers:Array.isArray(card?.triggers) ? [...card.triggers] : [],
+      entities:Array.isArray(card?.entities) ? [...card.entities] : [],
+      // Keep V1 fields populated for old readers and copies; V2 values are authoritative when present.
+      summary:compact, content:full, full, compact,
+      micro:String(card?.micro ?? (compact || full)).trim(),
+      exactQuote:String(card?.exactQuote || '').trim(), speaker:String(card?.speaker || '').trim(),
+      target:String(card?.target || '').trim(), context:String(card?.context || '').trim(),
+      location:String(card?.location || '').trim(), date:String(card?.date || '').trim(),
+    };
+  }
+
+  function loreCardText(card, density = 'DETAIL') {
+    const fields = loreCardContentFields(card);
+    const representation = density === 'MICRO' ? fields.micro || fields.compact || fields.full : density === 'COMPACT' ? fields.compact || fields.full : fields.full || fields.compact;
+    return [`유형: ${LORE_TYPES.includes(card?.type) ? card.type : '기타'}`, card?.type === '핵심 대사' && fields.exactQuote && `원문 대사${fields.speaker ? ` · ${fields.speaker}` : ''}: ${fields.exactQuote}`, representation && `${density === 'MICRO' ? '핵심' : density === 'COMPACT' ? '요약' : '상세'}: ${representation}`].filter(Boolean).join('\n');
+  }
+
+  function loreCardFullText(card) {
+    const fields = loreCardContentFields(card);
+    return [`유형: ${LORE_TYPES.includes(card?.type) ? card.type : '기타'}`, fields.compact && `요약: ${fields.compact}`, fields.full && `상세: ${fields.full}`, fields.micro && `한 줄: ${fields.micro}`, fields.exactQuote && `원문 대사: ${fields.exactQuote}`].filter(Boolean).join('\n');
+  }
+
+  function loreKeywordMatch(card, contextText) {
+    const haystack = String(contextText || '').toLocaleLowerCase('ko-KR');
+    if (!haystack) return '';
+    const keywords = [card?.title, ...(Array.isArray(card?.aliases) ? card.aliases : []), ...(Array.isArray(card?.triggers) ? card.triggers : [])]
+      .map(value => String(value || '').trim()).filter(Boolean);
+    return keywords.find(keyword => haystack.includes(keyword.toLocaleLowerCase('ko-KR'))) || '';
+  }
+
+  function loreMatchEvidence(card, contextText) {
+    const haystack = String(contextText || '').toLocaleLowerCase('ko-KR');
+    if (!haystack) return null;
+    const groups = [['title', [card?.title], 3], ['alias', card?.aliases, 2], ['trigger', card?.triggers, 1]];
+    const generic = new Set(['설정','세계관','설명','관련','인물','사용','상태','물건','물품','사진','기록','내용','기타','과거','현재','사건','정보','장소','가족']);
+    const hits = groups.flatMap(([kind, words, weight]) => (Array.isArray(words) ? words : [])
+      .map(word => String(word || '').trim()).filter(word => word.length >= 2 && !generic.has(word) && aliasAppears(haystack, word))
+      .map(word => ({ kind, word, score:weight * 100 + Math.min(80, word.length * 4) })));
+    return hits.sort((a,b) => b.score - a.score || b.word.length - a.word.length)[0] || null;
+  }
+
+  function loreWithDensity(item, density, room) {
+    const pack = lorePacksFor(room).find(entry => String(entry.id) === String(item.lorePackId));
+    const card = (pack?.cards || []).find(entry => String(entry.id) === String(item.loreCardId));
+    return { ...item, content:card ? loreCardText(card, density) : String(item.content || ''), loreDensity:density,
+      recallReason:`${item.loreBaseReason || item.recallReason || '자료집'} · ${density}` };
+  }
+
+  function loreInjectionCandidates(room, contextText) {
+    const result = [];
+    const cleanContext = stripAutomationNoise(contextText);
+    const semanticScores=semanticScoresForContext(room,contextText,'lore');
+    for (const pack of lorePacksFor(room)) {
+      if (pack?.enabled === false) continue;
+      for (const card of (Array.isArray(pack?.cards) ? pack.cards : [])) {
+        if (!card?.id || card.enabled === false || !LORE_MODES.includes(card.mode) || card.mode === 'off' || (card.mode === 'manual' && card.manualSelected === false)) continue;
+        const evidence = card.mode === 'auto' ? loreMatchEvidence(card, cleanContext) : null;
+        const semanticScore=card.mode==='auto'?Number(semanticScores.get(`${pack.id}:${card.id}`)||0):0;
+        const semanticMatch=semanticScore>=SEMANTIC_SEARCH.threshold;
+        if (card.mode === 'auto' && !evidence && !semanticMatch) continue;
+        if (!loreCardContentFields(card).full && !loreCardContentFields(card).compact) continue;
+        const content = loreCardText(card, 'DETAIL');
+        if (!content.trim()) continue;
+        const matchKind = evidence?.kind === 'title' ? '제목' : evidence?.kind === 'alias' ? '별칭' : '감지어';
+        const baseReason = evidence ? `${matchKind} “${evidence.word}” 일치` : card.mode === 'always' ? '항상 주입' : card.mode==='manual'?'직접 선택':'표현은 달라도 의미가 유사함';
+        const localBonus=card.mode==='auto'?localLoreRankBonus(card,evidence,room,contextText):0;
+        const reason=baseReason+(localBonus?' · 연결 인물 보조':'')+(semanticMatch?` · 의미 유사 ${Math.round(semanticScore*100)}%`:'');
+        result.push({
+          slotId:`lore:${card.id}`, lorePackId:String(pack.id || ''), loreCardId:String(card.id),
+          title:`${String(pack.title || '자료집')} · ${String(card.title || '제목 없음')}`,
+          group:'lore', autoType:'lore', loreMode:card.mode,
+          content, totalTurns:0, usedTurns:0,
+          loreDensity:'DETAIL', loreBaseReason:reason,
+          loreKeywordScore:evidence?.score||0, loreSemanticScore:semanticScore,
+          loreLocalScore:localBonus, loreMatchScore:(evidence?.score||0)+localBonus+(semanticMatch?semanticScore*80:0), loreMatchKind:evidence?.kind || (semanticMatch?'semantic':''),
+          matchedAlias:evidence?.word || '', recallReason:`${reason} · DETAIL`,
+        });
+      }
+    }
+    const rank = { always:0, manual:1, auto:2 };
+    return result.sort((a,b) => rank[a.loreMode] - rank[b.loreMode] || Number(b.loreMatchScore || 0) - Number(a.loreMatchScore || 0) || a.title.localeCompare(b.title, 'ko'));
+  }
+
+  function fitLoreItemsToBudget(room, baseItems, candidates, contextBudget = null, originalText = null) {
+    const limit = contextBudget == null ? contextBudgetForPreview(room) : Number(contextBudget);
+    const baseChars = buildContextBlockFromItems(baseItems).length;
+    const chosen = [];
+    const omittedTitles = [];
+    const fits = trial => {
+      const block = buildContextBlockFromItems([...baseItems, ...trial]);
+      return block.length <= limit && block.length - baseChars <= LORE_INJECTION_CHAR_LIMIT
+        && (originalText === null || carrierRequestWithinLimits(room, buildInjectedMessage(String(originalText || ''), block)));
+    };
+    for (const item of candidates) {
+      if (chosen.length >= LORE_INJECTION_CARD_LIMIT) { omittedTitles.push(item.title); continue; }
+      const first = loreWithDensity(item, item.loreMode === 'auto' ? 'COMPACT' : 'DETAIL', room);
+      const compact = loreWithDensity(item, 'COMPACT', room);
+      const micro = loreWithDensity(item, 'MICRO', room);
+      if (fits([...chosen, first])) chosen.push(first);
+      else if (first.loreDensity !== 'COMPACT' && fits([...chosen, compact])) chosen.push(compact);
+      else if (fits([...chosen, micro])) chosen.push(micro);
+      else omittedTitles.push(item.title);
+    }
+    // Auto cards enter compactly; upgrade each single representation only when space remains.
+    for (let index = 0; index < chosen.length; index++) {
+      if (chosen[index].loreMode !== 'auto' || chosen[index].loreDensity === 'DETAIL') continue;
+      if (chosen[index].loreDensity === 'MICRO') {
+        const compact = loreWithDensity(chosen[index], 'COMPACT', room);
+        const trial = chosen.slice(); trial[index] = compact;
+        if (fits(trial)) chosen[index] = compact;
+      }
+      if (chosen[index].loreDensity !== 'COMPACT') continue;
+      const detailed = loreWithDensity(chosen[index], 'DETAIL', room);
+      if (detailed.content === chosen[index].content) continue;
+      const trial = chosen.slice(); trial[index] = detailed;
+      if (fits(trial)) chosen[index] = detailed;
+    }
+    const previous = loreBudgetInfoFor(room);
+    loreBudgetInfoCache.set(room, { candidates:originalText === null ? candidates.length : Math.max(candidates.length, Number(previous?.candidates || 0)), included:chosen.length,
+      omittedTitles:[...(originalText === null ? [] : (previous?.omittedTitles || [])), ...omittedTitles].slice(0, 6), maxChars:LORE_INJECTION_CHAR_LIMIT, maxCards:LORE_INJECTION_CARD_LIMIT });
+    return chosen;
+  }
+
+  function snapshotSelectedItems(room, contextText = null, contextBudget = null) {
+    const ctx = contextText == null ? String(room.autoRecallContextText || '') : String(contextText || '');
+    const out = [];
+    for (const s of selectedSlots(room)) {
+      if (s.id === 'logSummary') continue; // v0.8: 로그 원문은 저장소이며 절대 통째로 주입하지 않습니다.
+      out.push({
+        slotId: s.id,
+        title: String(s.title || s.id || '메모').trim(),
+        group: s.group || 'extra',
+        content: String(s.content || '').trim(),
+        totalTurns: normalizeRetentionTurns(s.retentionTurns),
+        usedTurns: 0,
+        autoType: s.lastAutoMatch ? (s.group === 'character' ? 'character' : s.group === 'item' ? 'important-item' : undefined) : undefined,
+        matchedAlias: (s.group === 'character' || s.group === 'item') ? String(s.lastAutoMatch || '') : '',
+        autoConfidence: (s.group === 'character' || s.group === 'item') ? Number(s.lastAutoConfidence || 0) : 0,
+        autoDetectionReason: (s.group === 'character' || s.group === 'item') ? String(s.lastAutoReason || '') : '',
+        recallReason: (s.group === 'character' || s.group === 'item') && s.lastAutoMatch ? (s.lastAutoMatch === '사용자 고정' ? '사용자 고정' : (s.lastAutoReason ? `신뢰도 ${Number(s.lastAutoConfidence || 0)}% · 감지: ${s.lastAutoReason}` : `“${s.lastAutoMatch}” 감지`)) : '',
+      });
+    }
+    out.push(...storyTimelineInjectionItems(room));
+    out.push(...knowledgeInjectionItems(room, ctx));
+    const log = (room.slots || []).find(s => s.id === 'logSummary');
+    if (log?.enabled && String(log.content || '').trim()) {
+      const budget = contextBudget == null ? contextBudgetForPreview(room) : Number(contextBudget);
+      const candidates = collectLogRecallCandidates(room, ctx);
+      out.push(...fitLogItemsToBudget(room, out, candidates.filter(item => item.autoType === 'pinned-log' || item.autoType === 'manual-log'), budget));
+      out.push(...fitLoreItemsToBudget(room, out, loreInjectionCandidates(room, ctx), budget));
+      out.push(...fitLogItemsToBudget(room, out, candidates.filter(item => item.autoType !== 'pinned-log' && item.autoType !== 'manual-log'), budget, true));
+    } else {
+      out.push(...fitLoreItemsToBudget(room, out, loreInjectionCandidates(room, ctx), contextBudget));
+    }
+    return out;
+  }
+
+  function activePendingItems(pending) {
+    return (Array.isArray(pending?.items) ? pending.items : []).filter(item => {
+      const total = Number(item.totalTurns || 0);
+      return total === 0 || Number(item.usedTurns || 0) < total;
+    });
+  }
+
+  function pendingItemIdentity(item) {
+    if (!item) return '';
+    const isLog = item.sourceSlotId === 'logSummary' || item.group === 'log-auto' || item.slotId === 'logSummary';
+    const source = String(item.sourceKey || item.slotId || item.title || '').trim();
+    return source ? `${isLog ? 'log' : 'slot'}:${source.replace(/^auto-log:/, '')}` : '';
+  }
+
+  function quickRemovedPendingItems(pending) {
+    return Array.isArray(pending?.quickRemovedItems) ? pending.quickRemovedItems : [];
+  }
+
+  function applyQuickItemSuppression(pending) {
+    if (!pending) return 0;
+    const removedKeys = new Set(quickRemovedPendingItems(pending).map(pendingItemIdentity).filter(Boolean));
+    if (!removedKeys.size) return 0;
+    const before = Array.isArray(pending.items) ? pending.items.length : 0;
+    pending.items = (Array.isArray(pending.items) ? pending.items : []).filter(item => !removedKeys.has(pendingItemIdentity(item)));
+    return before - pending.items.length;
+  }
+
+  function quickManageItems(pending) {
+    const byKey = new Map();
+    for (const item of activePendingItems(pending)) {
+      const key = pendingItemIdentity(item);
+      if (key) byKey.set(key, { item, active:true });
+    }
+    for (const item of quickRemovedPendingItems(pending)) {
+      const key = pendingItemIdentity(item);
+      if (key && !byKey.has(key)) byKey.set(key, { item, active:false });
+    }
+    return [...byKey.entries()].map(([key, value]) => ({ key, ...value }));
+  }
+
+  function quickUninjectedSlotRows(room, pending) {
+    if (!room || !pending) return [];
+    const activeKeys = new Set(activePendingItems(pending).map(pendingItemIdentity).filter(Boolean));
+    const removedByKey = new Map(quickRemovedPendingItems(pending).map(item => [pendingItemIdentity(item), item]).filter(([key]) => key));
+    const rows = [];
+    for (const slot of (room.slots || [])) {
+      if (!['character','extra'].includes(String(slot?.group || ''))) continue;
+      if (!String(slot.content || '').trim()) continue;
+      const fresh = slotToPendingItem(slot);
+      const key = pendingItemIdentity(fresh);
+      if (!key || activeKeys.has(key)) continue;
+      const removed = removedByKey.get(key);
+      const item = removed
+        ? { ...removed, ...fresh, usedTurns:Number(removed.usedTurns || 0), totalTurns:normalizeRetentionTurns(slot.retentionTurns), quickManualInjection:true }
+        : { ...fresh, quickManualInjection:true, recallReason:'Quick Monitor 수동 추가' };
+      rows.push({ key, item, active:false, available:true, sessionRemoved:!!removed });
+    }
+    return rows;
+  }
+
+  function carrierOrderedItems(items) {
+    const active = (items || []).filter(i => String(i.content || '').trim());
+    const groups = new Set(['character','item','extra','lore']);
+    const placed = new Set();
+    const ordered = [];
+    for (const item of active) {
+      if (!groups.has(String(item.group || ''))) { ordered.push(item); continue; }
+      if (placed.has(item.group)) continue;
+      placed.add(item.group);
+      ordered.push(...active.filter(other => other.group === item.group));
+    }
+    return ordered;
+  }
+
+  const MANUAL_REVIEW_SECTIONS = Object.freeze([
+    ['currentState','현재상태'],['logSummary','날짜로그'],['timeline','타임라인'],
+    ['people','인물정보'],['items','중요 물품'],['tools','도구'],
+  ]);
+  const manualReviewHistoryCache = new Map();
+  function scheduleManualReviewHistory(room, force=false) {
+    const id=String(room?.chatId||'');
+    if (!id) return Promise.resolve(null);
+    const cached=manualReviewHistoryCache.get(id);
+    if (!force && cached && Date.now()-cached.checkedAt<30000) return cached.promise || Promise.resolve(cached);
+    if (cached?.promise) return cached.promise;
+    const entry={keys:cached?.keys||null,checkedAt:cached?.checkedAt||0,promise:null};
+    manualReviewHistoryCache.set(id,entry);
+    entry.promise=fetchAiMessageHistory(apiChatIdOf(room),'',5000).then(messages=>{
+      entry.keys=buildCompletedAiDialogueTurns(messages).map(turn=>String(turn.key));
+      entry.checkedAt=Date.now();
+      return entry;
+    }).catch(error=>{entry.checkedAt=Date.now();throw error;}).finally(()=>{entry.promise=null;});
+    return entry.promise;
+  }
+  function buildContextBlockFromItems(items) {
+    const active = (items || []).filter(i => String(i.content || '').trim());
+    if (!active.length) return '';
+    const groupLabels = { character:'캐릭터', item:'중요 물품', extra:'기타', lore:'자료집' };
+    const grouped = { character:[], item:[], extra:[], lore:[] };
+    const parts = [];
+    const placed = new Set();
+    for (const item of active) {
+      const title = String(item.title || item.slotId || '메모').trim();
+      const content = safeForHtmlComment(String(item.content || '').trim());
+      const group = String(item.group || '');
+      if (group === 'character' || group === 'item' || group === 'extra' || group === 'lore') {
+        grouped[group].push(`## ${title}\n${content}`);
+        if (!placed.has(group)) {
+          parts.push({ group });
+          placed.add(group);
+        }
+      } else {
+        parts.push({ text:`### ${title}\n${content}` });
+      }
+    }
+    const body = parts.map(part => part.text || `# ${groupLabels[part.group]}\n${grouped[part.group].join('\n\n')}`).join('\n\n');
+
+    return `${APP.markerStart} version="${APP.version}"\n` +
+      `[RP 연속성 참고]\n` +
+      `아래 자료는 출력하지 말고 현재 장면의 사실관계·연속성에만 참고한다.\n` +
+      `기존 RP의 언어·문체·대사·지문 형식을 그대로 유지한다.\n` +
+      `현재 대화의 더 최근 확정 사실과 충돌하면 최근 직접 대화를 우선한다.\n\n` +
+      `${body}\n` +
+      `${APP.markerEnd}`;
+  }
+
+  function buildContextBlock(room) {
+    return buildContextBlockFromItems(snapshotSelectedItems(room));
+  }
+
+  function stripOurContextBlock(text) {
+    const src = String(text || '');
+    const pairs = [[APP.markerStart, APP.markerEnd], [APP.legacyMarkerStart, APP.legacyMarkerEnd]];
+    let best = null;
+    for (const [startMarker, endMarker] of pairs) {
+      const start = src.lastIndexOf(startMarker);
+      if (start < 0) continue;
+      const end = src.indexOf(endMarker, start);
+      if (end < 0) continue;
+      if (!best || start > best.start) best = { start, end, endMarker };
+    }
+    if (!best) return { found: false, text: src };
+    const after = src.slice(best.end + best.endMarker.length).trim();
+    if (after) return { found: false, text: src };
+    return { found: true, text: src.slice(0, best.start).replace(/\s+$/, '') };
+  }
+
+  // Review only visible speech. Preserve the carrier trailer byte for byte,
+  // including its separator; incomplete/ambiguous blocks must never enter AI review.
+  function splitReviewedResponse(text) {
+    const src = String(text ?? '');
+    const starts = [...src.matchAll(/<!--RP_CONTEXT_MANAGER_START|<rp_context_manager\b/g)];
+    if (!starts.length) return { text:src, suffix:'', block:'', found:false, malformed:false };
+    const start = starts[0].index;
+    const visible = src.slice(0, start).replace(/\s+$/, '');
+    const endMarker = starts[0][0].startsWith('<!--') ? APP.markerEnd : APP.legacyMarkerEnd;
+    const end = src.indexOf(endMarker, start);
+    if (starts.length !== 1 || end < 0 || src.slice(end + endMarker.length).trim()) {
+      return { text:visible, suffix:'', block:'', found:false, malformed:true };
+    }
+    return { text:visible, suffix:src.slice(visible.length), block:src.slice(start, end + endMarker.length), found:true, malformed:false };
+  }
+
+  async function writeReviewedResponse(chatId, messageId, original, corrected) {
+    const room = state.currentRoom;
+    const currentScope = () => room && state.currentRoom === room &&
+      String(apiChatIdOf(room)) === String(chatId) && String(getChatIdFromPath()) === String(chatId);
+    if (!currentScope()) throw new Error('방이 바뀌었습니다. 현재 방의 응답을 다시 검수해 주세요.');
+    return queuePendingCarrierOperation(room, async () => {
+      const stale = () => { const error = new Error('검수 중 원문이 바뀌었습니다. 최신 응답을 다시 검수해 주세요.'); error.code = 'STALE_RESPONSE_REVIEW'; return error; };
+      if (!currentScope()) throw stale();
+      const fresh = await fetchMessage(chatId, String(messageId));
+      if (!currentScope() || !fresh || messageRoleOf(fresh) !== 'assistant') throw stale();
+      const parts = splitReviewedResponse(messageTextOf(fresh));
+      if (parts.malformed) throw new Error('숨김 주입 블록이 완전하지 않습니다. 주입 재검증 후 다시 검수해 주세요.');
+      if (parts.text !== String(original)) throw stale();
+      const next = String(corrected);
+      if (splitReviewedResponse(next).found || /RP_CONTEXT_MANAGER_(?:START|END)|<\/?rp_context_manager\b/.test(next)) {
+        throw new Error('교정본에는 숨김 주입 블록을 넣을 수 없습니다. 응답 본문만 수정해 주세요.');
+      }
+      const nextRaw = next + parts.suffix;
+      assertCarrierRequestWithinLimits(room, nextRaw, '교정 후 응답 총 길이');
+      // Uses the same queue as injection sync, carrier movement and release.
+      // Re-read inside the queue so a changed trailer is preserved, not overwritten.
+      await patchMessage(chatId, String(messageId), nextRaw);
+      let saved=null;
+      // 같은 PATCH를 반복하지 않고 저장 직후의 읽기 지연만 재확인합니다.
+      for(let attempt=0;attempt<3;attempt++){
+        if(!currentScope())throw stale();
+        saved=await fetchMessage(chatId,String(messageId));
+        if(saved&&messageTextOf(saved)===nextRaw)break;
+        if(saved&&messageTextOf(saved)!==messageTextOf(fresh))break; // 다른 수정은 덮어쓰지 않습니다.
+        if(attempt<2)await sleep(250*(attempt+1));
+      }
+      if (!currentScope() || !saved || messageTextOf(saved) !== nextRaw) {
+        const error = new Error('서버 저장 요청 후 실제 응답을 확인하지 못했습니다. 최신 응답을 다시 확인해 주세요.');
+        error.code = 'RESPONSE_READBACK_UNVERIFIED'; throw error;
+      }
+      let pendingSaveError = '';
+      const pending = room.pending;
+      if (parts.found && String(pending?.messageId) === String(messageId)) {
+        const metrics = carrierRequestMetrics(nextRaw);
+        pending.originalText = next; pending.originalChars = next.length;
+        pending.contextBlock = parts.block; pending.injectedChars = parts.block.length;
+        pending.carrierChars = nextRaw.length; pending.serverChars = nextRaw.length;
+        pending.carrierMessageBytes = metrics.messageBytes; pending.carrierPayloadBytes = metrics.payloadBytes;
+        pending.verified = true; pending.verifiedAt = Date.now();
+        stampVerifiedPendingSnapshot(pending, activePendingItems(pending), parts.block);
+        savePendingBackup(room.chatId, pending);
+        try { await saveRoom(room, 'responseRefiner'); }
+        catch (error) { pendingSaveError = String(error.message || error); }
+      }
+      sanitizeRenderedContextSoon();
+      updateQuickInjectionTrigger();
+      return { ok:true, id:String(messageId), content:next, rawContent:nextRaw, pendingSaveError };
+    });
+  }
+
+  function buildInjectedMessage(original, contextBlock) {
+    const stripped = stripOurContextBlock(String(original || ''));
+    const cleanOriginal = String(stripped.text || original || '').replace(/\s+$/, '');
+    return `${cleanOriginal}\n\n${contextBlock}`;
+  }
+
+  function contextStats(room) {
+    const items = snapshotSelectedItems(room);
+    const block = buildContextBlockFromItems(items);
+    const raw = items.reduce((n, i) => n + String(i.content || '').length, 0);
+    return { raw, block: block.length, count: items.length };
+  }
+
+  function statsForItems(items) {
+    const active = (items || []).filter(i => String(i.content || '').trim());
+    const block = buildContextBlockFromItems(active);
+    const raw = active.reduce((n, i) => n + String(i.content || '').length, 0);
+    return { raw, block:block.length, count:active.length };
+  }
+
+  function itemCategory(item) {
+    if (item.slotId === 'currentState') return '현재상태';
+    if (item.group === 'lore' || item.autoType === 'lore') return '자료집';
+    if (item.autoType === 'story-timeline' || item.group === 'story-timeline') return '타임라인';
+    if (item.autoType === 'knowledge' || item.group === 'knowledge') return '인지 현황';
+    if (item.autoType === 'pinned-log') return '항상 주입';
+    if (item.autoType === 'manual-log') return '직접 주입';
+    if (item.autoType === 'recent-log') return '최근 연속성';
+    if (item.autoType === 'related-log') return '관련로그';
+    if (item.slotId === 'logSummary' || item.sourceSlotId === 'logSummary' || item.group === 'log-auto') return '로그요약';
+    if (item.group === 'character') return '캐릭터';
+    if (item.group === 'item') return '중요 물품';
+    if (item.group === 'extra') return '기타·OOC';
+    // 과거 버전 pending 등 메타데이터가 불완전한 항목은 기타로 위장하지 않습니다.
+    return '분류 확인';
+  }
+
+  function categoryTone(label) {
+    if (label === '현재상태') return 'state';
+    if (label === '타임라인') return 'timeline';
+    if (label === '인지 현황') return 'knowledge';
+    if (/로그/.test(String(label || '')) || label === '직접 주입' || label === '항상 주입') return 'log';
+    if (label === '캐릭터') return 'character';
+    if (label === '중요 물품') return 'item';
+    if (label === '자료집') return 'knowledge';
+    if (label === '기타·OOC') return 'extra';
+    if (label === '분류 확인') return 'format';
+    return 'format';
+  }
+
+  function contextUsageSegments(items, blockChars, originalChars = 0, separatorChars = 0) {
+    const grouped = new Map();
+    for (const item of (items || [])) {
+      const label = itemCategory(item);
+      const tone = categoryTone(label);
+      const key = label;
+      const current = grouped.get(key) || { label:key, tone, count:0, chars:0 };
+      current.count++;
+      current.chars += String(item.content || '').length;
+      grouped.set(key, current);
+    }
+    const order = ['현재상태','인지 현황','타임라인','자료집','항상 주입','직접 주입','최근 연속성','관련로그','로그요약','캐릭터','중요 물품','기타·OOC','분류 확인'];
+    const result = order.filter(key => grouped.has(key)).map(key => grouped.get(key));
+    const rawChars = result.reduce((sum, item) => sum + item.chars, 0);
+    const overhead = Math.max(0, Number(blockChars || 0) - rawChars + Number(separatorChars || 0));
+    if (overhead) result.push({ label:'주입 형식', tone:'format', count:1, chars:overhead });
+    if (Number(originalChars) > 0) result.unshift({ label:'AI 답변 원문', tone:'carrier', count:1, chars:Number(originalChars) });
+    return result;
+  }
+
+  function renderUsageSummary(items, blockChars, maxChars, originalChars = 0, separatorChars = 0) {
+    const segments = contextUsageSegments(items, blockChars, originalChars, separatorChars);
+    const max = Math.max(1, Number(maxChars) || APP.defaultMaxChars);
+    const used = Math.max(1, Number(blockChars) + Number(originalChars) + Number(separatorChars) || 0);
+    const bars = segments.map(item => {
+      const width = Math.max(0.15, Math.min(100, item.chars / max * 100));
+      return `<span class="rpcm-usage-segment tone-${item.tone}" style="width:${width}%" title="${esc(item.label)} · ${formatCount(item.chars)}자"></span>`;
+    }).join('');
+    const chips = segments.map(item => {
+      const ofUsed = used ? item.chars / used * 100 : 0;
+      return `<span class="rpcm-breakdown-chip tone-${item.tone}"><i class="rpcm-usage-dot"></i><strong>${esc(item.label)}</strong><span>${formatCount(item.chars)}자 · ${ofUsed < 1 && ofUsed > 0 ? '&lt;1' : Math.round(ofUsed)}%</span></span>`;
+    }).join('');
+    const emptyWidth = Math.max(0, 100 - Math.min(100, used / max * 100));
+    return {
+      bar: `${bars}${emptyWidth ? `<span class="rpcm-usage-empty" style="width:${emptyWidth}%"></span>` : ''}`,
+      chips,
+    };
+  }
+
+  function itemReason(item) {
+    if ((item.autoType === 'character' || item.autoType === 'important-item') && item.matchedAlias === '사용자 고정') return '사용자 고정';
+    if ((item.autoType === 'character' || item.autoType === 'important-item') && item.autoDetectionReason) {
+      return `신뢰도 ${Number(item.autoConfidence || 0)}% · 감지: ${item.autoDetectionReason}`;
+    }
+    if (item.recallReason) return String(item.recallReason);
+    if ((item.autoType === 'character' || item.autoType === 'important-item') && item.matchedAlias) return `“${item.matchedAlias}” 감지`;
+    if (item.autoType === 'manual-log') return '사용자 직접 주입';
+    if (item.autoType === 'recent-log') return '최근이라 포함 · 활성 시간선의 직전 흐름';
+    if (item.autoType === 'pinned-log') return '사용자 항상 주입';
+    if (item.autoType === 'related-log') return '현재 RP와 관련';
+    return '';
+  }
+
+  // v0.9.0: 관련로그가 왜 선택됐는지 사용자가 확인할 수 있도록
+  // 실제 점수 구성과 후보 순위를 UI용 설명으로 노출합니다. 검색 로직 자체는 바꾸지 않습니다.
+  // 초기 v0.9.0에서 이미 만들어져 세부 메타데이터가 비어 있는 pending 관련로그는
+  // 마지막 자동회수 컨텍스트를 기준으로 한 번 재계산해 표시용 메타데이터를 보강합니다.
+  function hydrateRelatedLogEvidence(room, items) {
+    const targets = (items || []).filter(item => item?.autoType === 'related-log' && (
+      ((!Array.isArray(item.matchedCoreTerms) || !item.matchedCoreTerms.length) && (!Array.isArray(item.matchedCharacterTerms) || !item.matchedCharacterTerms.length)) ||
+      item.recallCoreScore === null || item.recallCoreScore === undefined || item.recallCoreScore === '' ||
+      item.recallCharacterScore === null || item.recallCharacterScore === undefined || item.recallCharacterScore === '' ||
+      !Number(item.recallRank || 0) || !Number(item.recallCandidateCount || 0)
+    ));
+    if (!targets.length) return false;
+
+    const slot = (room?.slots || []).find(s => s.id === 'logSummary');
+    const contextText = String(room?.autoRecallContextText || '').trim();
+    if (!slot?.enabled || !String(slot.content || '').trim() || !contextText) return false;
+    const blocks = parseDatedLogBlocks(slot.content);
+    if (!blocks.length) return false;
+
+    const excludedKeys = new Set((room.autoLogExcludedKeys || []).map(String));
+    const pinnedKeys = new Set((room.autoLogPinnedKeys || []).map(String));
+    const manualKeys = new Set((room.manualLogSelectedKeys || []).map(String));
+    const eligible = autoRecallVisibleLogBlocks(blocks, room).filter(b => !excludedKeys.has(b.key));
+    const skip = new Set([...excludedKeys, ...pinnedKeys, ...manualKeys]);
+    const recentKeys = new Set(recentContinuityLogBlocks(room, eligible, excludedKeys).map(block => String(block.key)));
+    const candidates = eligibleRelatedLogScores(room, eligible, contextText, skip).filter(entry => !recentKeys.has(String(entry.block.key))).slice(0, relatedLogInjectionCount(room));
+    const byKey = new Map(candidates.map((scored, index) => [String(scored.block.key), { scored, rank:index + 1 }]));
+    let changed = false;
+
+    for (const item of targets) {
+      const hit = byKey.get(String(item.sourceKey || '').trim());
+      if (!hit) continue;
+      const { scored, rank } = hit;
+      Object.assign(item, {
+        recallReason: `${logTimelineLabelOfBlock(scored.block)} · ${relatedLogReason(scored)}`,
+        recallScore: scored.score,
+        recallCoreScore: scored.coreScore,
+        recallCharacterScore: scored.characterScore,
+        recallRank: rank,
+        recallCandidateCount: candidates.length,
+        matchedTerms:[...(scored.matchedPhrases || []), ...(scored.matchedCoreTokens || []), ...(scored.matchedCharacterTerms || [])],
+        matchedCoreTerms:[...(scored.matchedPhrases || []), ...(scored.matchedCoreTokens || []), ...(scored.matchedRareTokens || [])],
+        matchedCharacterTerms:[...(scored.matchedCharacterTerms || [])],
+      });
+      changed = true;
+    }
+    return changed;
+  }
+
+  // 자동 호출 설명창은 실제 pending 배열의 삽입 순서가 아니라 종류별로 묶어 보여줍니다.
+  // 주입 본문의 실제 순서는 건드리지 않고 UI 표시 순서만 정리합니다.
+  function sortAutoItemsForDisplay(items) {
+    const priority = {
+      'character': 0,
+      'important-item': 1,
+      'pinned-log': 2,
+      'manual-log': 3,
+      'recent-log': 4,
+      'related-log': 5,
+      'legacy-log': 6,
+    };
+    return (items || []).map((item, index) => ({ item, index })).sort((a, b) => {
+      const pa = priority[a.item?.autoType] ?? 9;
+      const pb = priority[b.item?.autoType] ?? 9;
+      if (pa !== pb) return pa - pb;
+      if (a.item?.autoType === 'related-log' && b.item?.autoType === 'related-log') {
+        const ra = Number(a.item.recallRank || 9999);
+        const rb = Number(b.item.recallRank || 9999);
+        if (ra !== rb) return ra - rb;
+      }
+      return a.index - b.index;
+    }).map(x => x.item);
+  }
+
+  function relatedLogEvidence(item) {
+    if (!['related-log','recent-log'].includes(item?.autoType)) return '';
+    const core = [...new Set((item.matchedCoreTerms || []).map(String).filter(Boolean))].slice(0, 4);
+    const chars = [...new Set((item.matchedCharacterTerms || []).map(String).filter(Boolean))].slice(0, 3);
+    const bits = [];
+    if (core.length) bits.push(`핵심어 ${core.join(' · ')}`);
+    if (chars.length) bits.push(`인물 보조 ${chars.join(' · ')}`);
+
+    const hasTotal = item.recallScore !== null && item.recallScore !== undefined && item.recallScore !== '' && Number.isFinite(Number(item.recallScore));
+    const hasCoreScore = item.recallCoreScore !== null && item.recallCoreScore !== undefined && item.recallCoreScore !== '' && Number.isFinite(Number(item.recallCoreScore));
+    const hasCharacterScore = item.recallCharacterScore !== null && item.recallCharacterScore !== undefined && item.recallCharacterScore !== '' && Number.isFinite(Number(item.recallCharacterScore));
+    if (hasTotal) {
+      const total = Number(item.recallScore);
+      if (hasCoreScore && hasCharacterScore) {
+        bits.push(`관련도 점수 ${total.toFixed(1)} = 핵심 ${Number(item.recallCoreScore).toFixed(1)} + 인물 ${Number(item.recallCharacterScore).toFixed(1)}`);
+      } else {
+        // 이전 0.9.0에서 이미 만들어진 pending 항목처럼 세부점수가 없는 경우
+        // 없는 값을 0.0으로 꾸며내지 않고 실제로 저장된 총점만 보여줍니다.
+        bits.push(`관련도 점수 ${total.toFixed(1)}`);
+      }
+    }
+    const rank = Number(item.recallRank || 0);
+    const candidateCount = Number(item.recallCandidateCount || 0);
+    if (rank > 0 && candidateCount > 0) bits.push(`후보 ${candidateCount}개 중 ${rank}위`);
+    return bits.join(' · ');
+  }
+
+  function getDataWarnings(room) {
+    const warnings = [];
+    const log = (room.slots || []).find(x => x.id === 'logSummary');
+    const blocks = parseDatedLogBlocks(log?.content || '');
+    if (String(log?.content || '').trim() && !blocks.length && String(log.content || '').length > APP.legacyWholeLogFallbackMax) warnings.push('로그요약이 길지만 날짜 블록을 감지하지 못해 통짜 주입을 차단함. [2026년 8월 31일-사건명]·[BC206-사건명] 같은 형식을 사용해 주세요.');
+    if (blocks.length) {
+      const noYearCount = blocks.filter(b => !b.isUnknown && !b.isSpecialDate && b.year == null).length;
+      const acceptedUnknown = new Set((room.acceptedUnknownLogKeys || []).map(String));
+      const unknownCount = blocks.filter(b => b.isUnknown && !acceptedUnknown.has(String(b.key))).length;
+      if (noYearCount) warnings.push(`연도 없는 날짜 로그 ${noYearCount}개 있음. ‘날짜 정리’에서 선택한 항목에 2024년/2025년처럼 연도를 일괄 적용할 수 있음.`);
+      if (unknownCount) warnings.push(`확인하지 않은 날짜 미상 로그 ${unknownCount}개 있음. ‘날짜 수정’에서 ‘날짜 미상으로 계속 유지’를 체크하면 이 안내를 숨길 수 있음.`);
+      const byDate = new Map();
+      for (const b of blocks) {
+        if (b.isUnknown) continue;
+        byDate.set(b.dateKey, (byDate.get(b.dateKey) || 0) + 1);
+      }
+      const byBlockKey = new Map(blocks.filter(b => !b.isUnknown).map(b => [b.dateKey, b]));
+      const dupDates = [...byDate.entries()].filter(([,n]) => n > 1).map(([k,n]) => {
+        const block = byBlockKey.get(k);
+        return `${block?.fullDate || k.replace(/^x-/, '').split('::')[0]} · ${logTimelineLabelOfBlock(block)} (${n}개)`;
+      });
+      if (dupDates.length) {
+        const duplicateGroups = duplicateLogDateGroups(room);
+        const branchHint = duplicateGroups.map(timelineBranchHintForGroup).find(Boolean) || '';
+        warnings.push(branchHint
+          ? `시간선 분기 가능성 감지(“${branchHint}”): 같은 날짜 블록을 확인해 기본/회귀 시간선 폴더로 나눠 주세요. ${dupDates.join(', ')}`
+          : `같은 시간선·날짜 로그가 여러 블록으로 감지됨: ${dupDates.join(', ')}`);
+      }
+    }
+    const chars = (room.slots || []).filter(x => x.group === 'character');
+    const byName = new Map();
+    for (const c of chars) {
+      const k = libraryItemKey(c);
+      if (!k) continue;
+      byName.set(k, (byName.get(k) || 0) + 1);
+    }
+    const dupChars = [...byName.entries()].filter(([,n]) => n > 1).map(([k,n]) => `${k} (${n}개)`);
+    if (dupChars.length) warnings.push(`같은 이름의 캐릭터 설정이 중복됨: ${dupChars.join(', ')}`);
+    if (room._logBudgetInfo?.omitted) warnings.push(`주입 안전선(45,000자·UTF-8 ${formatCount(APP.safeCarrierPayloadBytes)}바이트) 때문에 로그 ${room._logBudgetInfo.omitted}개를 이번 주입 후보에서 자동 제외함.${room._logBudgetInfo.omittedTitles?.length ? ` (${room._logBudgetInfo.omittedTitles.join(', ')})` : ''}`);
+    return warnings;
+  }
+
+  function openDetachedEditor(slot, sourceTextarea) {
+    document.querySelector('#rpcm-detached-backdrop')?.remove();
+    if (!slot || !sourceTextarea) return;
+
+    const originalText = String(sourceTextarea.value || '');
+    const kind = slot.id === 'currentState' ? 'currentState' : slot.id === 'logSummary' ? 'logSummary' : 'plain';
+    const backdrop = document.createElement('div');
+    backdrop.id = 'rpcm-detached-backdrop';
+    backdrop.innerHTML = `
+      <div class="rpcm-detached-editor" role="dialog" aria-modal="true" aria-label="${esc(slot.title)} 크게 편집">
+        <div class="rpcm-detached-head">
+          <div class="rpcm-detached-head-main"><strong>${slot.id === 'currentState' ? '🧭' : slot.id === 'logSummary' ? '🗓️' : '✏️'} ${esc(slot.title)} 크게 편집</strong><span id="rpcm-detached-format"></span></div>
+          <span class="rpcm-detached-chars" id="rpcm-detached-chars">${formatCount(originalText.length)}자</span>
+          <span class="rpcm-detached-save-state" id="rpcm-detached-save-state">원본 유지</span>
+          <button type="button" class="rpcm-detached-mobile-done" id="rpcm-detached-mobile-done">완료</button>
+          <button type="button" class="rpcm-iconbtn" id="rpcm-detached-x" aria-label="닫기" data-rpcm-close="icon">✕</button>
+        </div>
+        <div class="rpcm-detached-toolbar">
+          <div class="rpcm-detached-search"><div class="rpcm-detached-search-box"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"></circle><path d="m16 16 4.2 4.2"></path></svg><input id="rpcm-detached-search" placeholder="검색"></div><button type="button" id="rpcm-detached-search-prev" title="이전 결과">↑</button><button type="button" id="rpcm-detached-search-next" title="다음 결과">↓</button><span id="rpcm-detached-search-count">0 / 0</span></div>
+          <span class="rpcm-detached-log-selection-summary" id="rpcm-detached-log-selection-summary" hidden></span>
+          <button type="button" class="rpcm-editor-action rpcm-detached-favorite-filter" id="rpcm-detached-favorites-only" ${kind === 'logSummary' ? '' : 'hidden'}>☆ 전체 보기</button>
+          <button type="button" class="rpcm-editor-action rpcm-detached-add-log" id="rpcm-detached-add-log" hidden>＋ 날짜 블록 추가</button>
+          <button type="button" class="rpcm-editor-action" id="rpcm-detached-mode">원문 보기</button>
+          <button type="button" class="rpcm-editor-action" id="rpcm-detached-expand">전체 펼치기</button>
+          <button type="button" class="rpcm-editor-action" id="rpcm-detached-collapse">전체 접기</button>
+          <button type="button" class="rpcm-editor-action" id="rpcm-detached-copy">전체 복사</button>
+        </div>
+        <div class="rpcm-detached-log-bulkbar" id="rpcm-detached-log-bulkbar" ${kind === 'logSummary' ? '' : 'hidden'}><strong>시간선 일괄 이동</strong><span id="rpcm-detached-log-bulk-count">선택 0개</span><select id="rpcm-detached-log-bulk-target" aria-label="이동할 시간선"></select><button type="button" id="rpcm-detached-log-bulk-clear">선택 해제</button><button type="button" id="rpcm-detached-log-bulk-move">선택 이동</button></div>
+        <div class="rpcm-detached-layout">
+          <aside class="rpcm-detached-nav" id="rpcm-detached-nav"></aside>
+          <main class="rpcm-detached-main" id="rpcm-detached-main"></main>
+        </div>
+        <div class="rpcm-detached-foot">
+          <span class="rpcm-detached-note">실제 저장값은 기존처럼 평문 1개입니다. 블록 화면은 편집할 때만 구조화해서 보여줍니다.</span>
+          <button type="button" class="rpcm-btn secondary" id="rpcm-detached-cancel">취소</button>
+          <button type="button" class="rpcm-btn primary" id="rpcm-detached-apply">적용하고 닫기</button>
+        </div>
+      </div>`;
+    document.body.appendChild(backdrop);
+
+    const main = backdrop.querySelector('#rpcm-detached-main');
+    const nav = backdrop.querySelector('#rpcm-detached-nav');
+    const formatEl = backdrop.querySelector('#rpcm-detached-format');
+    const charsEl = backdrop.querySelector('#rpcm-detached-chars');
+    const saveStateEl = backdrop.querySelector('#rpcm-detached-save-state');
+    const modeBtn = backdrop.querySelector('#rpcm-detached-mode');
+    const expandBtn = backdrop.querySelector('#rpcm-detached-expand');
