@@ -1,0 +1,999 @@
+        modified:value=>isGuideTextModified('logSummary', selected, value),
+        save:async value=>{ saveLogSummaryGuideVariant(selected, false); saveGuideText('logSummary', value, selected); },
+      };
+    }
+    if (kind === 'timeline') return {
+      title:'타임라인 지침', description:'현재 사용 중인 연속성 타임라인 지침을 확인하고 편집합니다.',
+      value:()=>effectiveTimelineGuide(room), defaultValue:()=>canonicalGuideText('timeline'),
+      modified:value=>isStoryTimelineGuideModified(room, value),
+      save:async value=>{ room.storyTimelineGuide=value; room.storyTimelineGuideSource=value===canonicalGuideText('timeline')?'builtin-v1.7.2':'custom'; room.storyTimelineGuideRevisionV15=true; await saveRoom(room); },
+    };
+    return {
+      title:'인물정보 지침', description:'현재 사용 중인 인물정보 지침을 확인하고 편집합니다.',
+      value:()=>effectivePersonGuide(room), defaultValue:()=>canonicalGuideText('personInfo'),
+      modified:value=>isPersonGuideModified(room, value),
+      save:async value=>{ room.personStateGuide=value; await saveRoom(room); },
+    };
+  }
+
+  function commonGuideButtonLabel(room, kind) {
+    const modified = kind === 'currentState' ? isGuideTextModified('currentState')
+      : kind === 'logSummary' ? isGuideTextModified('logSummary', getLogSummaryGuideVariant(false))
+        : kind === 'timeline' ? isStoryTimelineGuideModified(room)
+          : isPersonGuideModified(room);
+    return `지침${modified ? ' · 수정됨' : ''}`;
+  }
+
+  function openCommonGuideEditor(room, kind) {
+    document.querySelector('#rpcm-common-guide-backdrop')?.remove();
+    let variant = kind === 'logSummary' ? getLogSummaryGuideVariant(false) : '';
+    let spec = commonGuideEditorSpec(room, kind, variant);
+    let savedValue = spec.value();
+    const backdrop = document.createElement('div');
+    backdrop.id = 'rpcm-common-guide-backdrop';
+    backdrop.innerHTML = `<section class="rpcm-common-guide-dialog" role="dialog" aria-modal="true" aria-labelledby="rpcm-common-guide-title">
+      <header><div><h2 id="rpcm-common-guide-title">${esc(spec.title)}</h2><p>${esc(spec.description)}</p></div><button type="button" data-guide-action="close" aria-label="닫기" data-rpcm-close="icon">${rpcmUiIcon('close')}</button></header>
+      <div class="rpcm-common-guide-tools">${kind === 'logSummary' ? `<label><span>지침 종류</span><select id="rpcm-common-guide-variant"><option value="general" ${variant === 'general' ? 'selected' : ''}>일반용</option><option value="adult" ${variant === 'adult' ? 'selected' : ''}>성인용</option></select></label>` : ''}<span class="rpcm-common-guide-state" id="rpcm-common-guide-state"></span></div>
+      <textarea id="rpcm-common-guide-text" spellcheck="false"></textarea>
+      <footer><button type="button" class="rpcm-btn secondary" data-guide-action="copy">내용 복사</button><button type="button" class="rpcm-btn secondary" data-guide-action="reset">기본값 복원</button><span></span><button type="button" class="rpcm-btn secondary" data-guide-action="close">취소</button><button type="button" class="rpcm-btn primary" data-guide-action="save">저장</button></footer>
+    </section>`;
+    document.body.appendChild(backdrop);
+    const textarea = backdrop.querySelector('#rpcm-common-guide-text');
+    const stateLabel = backdrop.querySelector('#rpcm-common-guide-state');
+    const variantSelect = backdrop.querySelector('#rpcm-common-guide-variant');
+    const refresh = () => {
+      const modified = spec.modified(textarea.value);
+      const unsaved = textarea.value !== savedValue;
+      stateLabel.textContent = `${modified ? '수정된 지침' : '기본 지침'}${unsaved ? ' · 저장 안 됨' : ''}`;
+      stateLabel.classList.toggle('is-modified', modified);
+      stateLabel.classList.toggle('is-dirty', unsaved);
+    };
+    const load = () => { spec=commonGuideEditorSpec(room, kind, variant); savedValue=spec.value(); textarea.value=savedValue; refresh(); };
+    const close = () => {
+      if (textarea.value !== savedValue && !confirm('저장하지 않은 지침 변경사항을 버리고 닫을까요?')) return;
+      document.removeEventListener('keydown', onKeydown, true); backdrop.remove();
+    };
+    const onKeydown = event => { if (event.key === 'Escape') { event.preventDefault(); close(); } };
+    load();
+    textarea.addEventListener('input', refresh);
+    variantSelect?.addEventListener('change', event => {
+      if (textarea.value !== savedValue && !confirm('저장하지 않은 변경사항을 버리고 다른 지침을 열까요?')) { event.target.value=variant; return; }
+      variant=normalizeLogSummaryGuideVariant(event.target.value); saveLogSummaryGuideVariant(variant, false); load();
+    });
+    backdrop.addEventListener('click', async event => {
+      if (event.target === backdrop) { close(); return; }
+      const action = event.target.closest('[data-guide-action]')?.dataset.guideAction;
+      if (!action) return;
+      if (action === 'close') { close(); return; }
+      if (action === 'copy') {
+        const copied = await copyPlainText(externalChatTitleInstruction(kind)+"\n\n"+textarea.value);
+        notify(copied ? `${spec.title}을 복사했습니다.` : '지침 복사에 실패했습니다.', copied ? 'success' : 'error', 3200);
+        return;
+      }
+      if (action === 'reset') {
+        if (!confirm(`${spec.title}을 기본값으로 되돌릴까요?\n저장을 눌러야 실제 지침에 반영됩니다.`)) return;
+        textarea.value=spec.defaultValue(); refresh(); textarea.focus(); return;
+      }
+      if (action === 'save') {
+        const saveButton = backdrop.querySelector('[data-guide-action="save"]');
+        saveButton.disabled=true;
+        try {
+          await spec.save(textarea.value); savedValue=textarea.value; refresh(); notify(`${spec.title}을 저장했습니다.`, 'success', 3200);
+          backdrop.remove(); document.removeEventListener('keydown', onKeydown, true); renderModalIfOpen();
+        } catch (error) {
+          saveButton.disabled=false;
+          notify(`지침 저장에 실패했습니다: ${error?.message || error}`, 'error', 5200);
+        }
+      }
+    });
+    document.addEventListener('keydown', onKeydown, true);
+    setTimeout(()=>textarea.focus(), 0);
+  }
+
+  function loadUiPrefs() {
+    const fallback = { density: 'comfortable', editorHeights: {}, desktopQuickTriggerVisible: true };
+    try {
+      const parsed = JSON.parse(localStorage.getItem(APP.uiPrefsKey) || 'null');
+      if (!parsed || typeof parsed !== 'object') return fallback;
+      return {
+        density: parsed.density === 'compact' ? 'compact' : 'comfortable',
+        editorHeights: parsed.editorHeights && typeof parsed.editorHeights === 'object' ? parsed.editorHeights : {},
+        desktopQuickTriggerVisible: parsed.desktopQuickTriggerVisible !== false,
+      };
+    } catch (_) { return fallback; }
+  }
+
+  function saveUiPrefs(next) {
+    try { localStorage.setItem(APP.uiPrefsKey, JSON.stringify(next || loadUiPrefs())); } catch (_) {}
+  }
+
+  function normalizeRpcmAccentHex(value) {
+    const raw = String(value || '').trim();
+    const short = raw.match(/^#([0-9a-f]{3})$/i);
+    if (short) return `#${short[1].split('').map(ch => ch + ch).join('').toUpperCase()}`;
+    const full = raw.match(/^#([0-9a-f]{6})$/i);
+    return full ? `#${full[1].toUpperCase()}` : '';
+  }
+
+  function rpcmHexToRgb(hex) {
+    const value = normalizeRpcmAccentHex(hex);
+    if (!value) return null;
+    return { r:parseInt(value.slice(1,3),16), g:parseInt(value.slice(3,5),16), b:parseInt(value.slice(5,7),16) };
+  }
+
+  function rpcmRgbToHex(r, g, b) {
+    const part = value => Math.max(0, Math.min(255, Math.round(Number(value) || 0))).toString(16).padStart(2, '0');
+    return `#${part(r)}${part(g)}${part(b)}`.toUpperCase();
+  }
+
+  function rpcmRgbToHsv(rgb) {
+    const r = rgb.r / 255, g = rgb.g / 255, b = rgb.b / 255;
+    const max = Math.max(r,g,b), min = Math.min(r,g,b), d = max - min;
+    let h = 0;
+    if (d) {
+      if (max === r) h = 60 * (((g - b) / d) % 6);
+      else if (max === g) h = 60 * (((b - r) / d) + 2);
+      else h = 60 * (((r - g) / d) + 4);
+    }
+    if (h < 0) h += 360;
+    return { h, s:max ? d / max : 0, v:max };
+  }
+
+  function rpcmHsvToRgb(h, s, v) {
+    const hue = ((Number(h) % 360) + 360) % 360;
+    const sat = Math.max(0, Math.min(1, Number(s) || 0));
+    const val = Math.max(0, Math.min(1, Number(v) || 0));
+    const c = val * sat, x = c * (1 - Math.abs((hue / 60) % 2 - 1)), m = val - c;
+    let r=0,g=0,b=0;
+    if (hue < 60) [r,g,b]=[c,x,0];
+    else if (hue < 120) [r,g,b]=[x,c,0];
+    else if (hue < 180) [r,g,b]=[0,c,x];
+    else if (hue < 240) [r,g,b]=[0,x,c];
+    else if (hue < 300) [r,g,b]=[x,0,c];
+    else [r,g,b]=[c,0,x];
+    return { r:(r+m)*255, g:(g+m)*255, b:(b+m)*255 };
+  }
+
+  function rpcmRelativeLuminance(hex) {
+    const rgb = typeof hex === 'string' ? rpcmHexToRgb(hex) : hex;
+    if (!rgb) return 0;
+    const linear = value => { const c=Number(value)/255; return c <= .04045 ? c/12.92 : Math.pow((c+.055)/1.055,2.4); };
+    return .2126*linear(rgb.r) + .7152*linear(rgb.g) + .0722*linear(rgb.b);
+  }
+
+  function rpcmAccentInkForHex(hex) {
+    const luminance = rpcmRelativeLuminance(hex);
+    const whiteContrast = 1.05 / (luminance + .05);
+    const darkContrast = (luminance + .05) / .05;
+    return darkContrast >= whiteContrast ? '#171216' : '#FFFFFF';
+  }
+
+  function rpcmMixHex(a, b, bWeight = .5) {
+    const aa = rpcmHexToRgb(normalizeRpcmAccentHex(a));
+    const bb = rpcmHexToRgb(normalizeRpcmAccentHex(b));
+    if (!aa || !bb) return normalizeRpcmAccentHex(a) || normalizeRpcmAccentHex(b) || '#000000';
+    const t = Math.max(0, Math.min(1, Number(bWeight) || 0));
+    return rpcmRgbToHex(
+      aa.r * (1 - t) + bb.r * t,
+      aa.g * (1 - t) + bb.g * t,
+      aa.b * (1 - t) + bb.b * t
+    );
+  }
+
+  // 한 가지 배경 메인색에서 밝은/어두운 테마용 표면 계층을 각각 생성합니다.
+  // 사이트의 라이트/다크 모드가 바뀌어도 같은 색상 계열을 유지하면서 카드·시트·선의 명도 차이는 보존합니다.
+  function rpcmSurfacePaletteForHex(hex) {
+    const base = normalizeRpcmAccentHex(hex) || '#6B4057';
+    const white = '#FFFFFF', black = '#000000';
+    const lightBg = rpcmMixHex(base, '#F3F0F2', .78);
+    const lightSheet = rpcmMixHex(base, '#FAF7F9', .87);
+    const lightCard = rpcmMixHex(base, white, .93);
+    const lightCard2 = rpcmMixHex(base, '#F6F1F4', .82);
+    const lightLine = rpcmMixHex(lightBg, black, .13);
+    const lightLine2 = rpcmMixHex(lightBg, black, .07);
+    const lightFg = '#252126';
+    const lightFg2 = rpcmMixHex(lightFg, lightSheet, .20);
+    const lightMuted = rpcmMixHex(lightFg, lightSheet, .22);
+
+    const darkBg = rpcmMixHex(base, '#09090B', .88);
+    const darkSheet = rpcmMixHex(base, '#141216', .82);
+    const darkCard = rpcmMixHex(base, '#211D21', .76);
+    const darkCard2 = rpcmMixHex(base, '#2A242A', .72);
+    const darkLine = rpcmMixHex(darkCard, white, .18);
+    const darkLine2 = rpcmMixHex(darkCard, white, .10);
+    const darkFg = '#F7F5F6';
+    const darkFg2 = rpcmMixHex(darkFg, darkSheet, .10);
+    const darkMuted = rpcmMixHex(darkFg, darkSheet, .12);
+
+    return {
+      light:{ bg:lightBg, sheet:lightSheet, card:lightCard, card2:lightCard2, line:lightLine, line2:lightLine2, fg:lightFg, fg2:lightFg2, muted:lightMuted },
+      dark:{ bg:darkBg, sheet:darkSheet, card:darkCard, card2:darkCard2, line:darkLine, line2:darkLine2, fg:darkFg, fg2:darkFg2, muted:darkMuted }
+    };
+  }
+
+  function loadRpcmAccentTheme() {
+    try { return normalizeRpcmAccentHex(localStorage.getItem(APP.accentThemeKey) || ''); } catch (_) { return ''; }
+  }
+
+  function loadRpcmSurfaceTheme() {
+    try { return normalizeRpcmAccentHex(localStorage.getItem(APP.surfaceThemeKey) || ''); } catch (_) { return ''; }
+  }
+
+  function applyRpcmAccentTheme(hex = loadRpcmAccentTheme()) {
+    const value = normalizeRpcmAccentHex(hex);
+    const targets = [document.documentElement, document.body].filter(Boolean);
+    for (const target of targets) {
+      target.classList.toggle('rpcm-custom-accent', !!value);
+      if (value) {
+        target.style.setProperty('--wish-user-accent', value);
+        target.style.setProperty('--wish-user-accent-ink', rpcmAccentInkForHex(value));
+      } else {
+        target.style.removeProperty('--wish-user-accent');
+        target.style.removeProperty('--wish-user-accent-ink');
+      }
+    }
+    return value;
+  }
+
+  function applyRpcmSurfaceTheme(hex = loadRpcmSurfaceTheme()) {
+    const value = normalizeRpcmAccentHex(hex);
+    const palette = value ? rpcmSurfacePaletteForHex(value) : null;
+    const targets = [document.documentElement, document.body].filter(Boolean);
+    const names = ['bg','sheet','card','card2','line','line2','fg','fg2','muted'];
+    for (const target of targets) {
+      target.classList.toggle('rpcm-custom-surface', !!value);
+      if (value && palette) {
+        target.style.setProperty('--wish-user-surface', value);
+        for (const tone of ['light','dark']) {
+          for (const name of names) target.style.setProperty(`--wish-user-${name}-${tone}`, palette[tone][name]);
+        }
+      } else {
+        target.style.removeProperty('--wish-user-surface');
+        for (const tone of ['light','dark']) for (const name of names) target.style.removeProperty(`--wish-user-${name}-${tone}`);
+      }
+    }
+    return value;
+  }
+
+  function saveRpcmAccentTheme(hex) {
+    const value = normalizeRpcmAccentHex(hex);
+    try {
+      if (value) localStorage.setItem(APP.accentThemeKey, value);
+      else localStorage.removeItem(APP.accentThemeKey);
+    } catch (_) {}
+    return applyRpcmAccentTheme(value);
+  }
+
+  function saveRpcmSurfaceTheme(hex) {
+    const value = normalizeRpcmAccentHex(hex);
+    try {
+      if (value) localStorage.setItem(APP.surfaceThemeKey, value);
+      else localStorage.removeItem(APP.surfaceThemeKey);
+    } catch (_) {}
+    return applyRpcmSurfaceTheme(value);
+  }
+
+  function rpcmCurrentAccentForPicker() {
+    const saved = loadRpcmAccentTheme();
+    if (saved) return saved;
+    const host = document.body || document.documentElement;
+    const computed = host ? getComputedStyle(host).getPropertyValue('--wish-accent').trim() : '';
+    return normalizeRpcmAccentHex(computed) || '#DF78AA';
+  }
+
+  function rpcmCurrentSurfaceForPicker() {
+    const saved = loadRpcmSurfaceTheme();
+    if (saved) return saved;
+    const host = document.body || document.documentElement;
+    const computed = host ? getComputedStyle(host).getPropertyValue('--wish-sheet').trim() : '';
+    return normalizeRpcmAccentHex(computed) || '#6B4057';
+  }
+
+  function editorHeightPreference(slot) {
+    const prefs = loadUiPrefs();
+    if (['currentState', 'logSummary'].includes(slot.id)) {
+      const shared = Number(prefs.editorHeights?.fixedMemory);
+      if (Number.isFinite(shared) && shared >= 140 && shared <= 1200) return Math.round(shared);
+      return 300;
+    }
+    const saved = Number(prefs.editorHeights?.[slot.id]);
+    if (Number.isFinite(saved) && saved >= 140 && saved <= 1200) return Math.round(saved);
+    return 190;
+  }
+
+  function rememberEditorHeight(slot, textarea) {
+    if (!slot || !textarea || !['currentState', 'logSummary'].includes(slot.id)) return;
+    const height = Math.max(140, Math.min(1200, Math.round(textarea.getBoundingClientRect().height || 0)));
+    if (!height) return;
+    const prefs = loadUiPrefs();
+    prefs.editorHeights = { ...(prefs.editorHeights || {}), fixedMemory: height, currentState: height, logSummary: height };
+    saveUiPrefs(prefs);
+    // 현재상태/로그요약 축소 편집창은 항상 같은 높이를 유지합니다.
+    state.modal?.querySelectorAll('.rpcm-slot[data-slot-id="currentState"] .rpcm-textarea, .rpcm-slot[data-slot-id="logSummary"] .rpcm-textarea').forEach(el => {
+      if (el !== textarea) el.style.height = `${height}px`;
+    });
+  }
+
+  function cleanedPastedText(value) {
+    let text = String(value == null ? '' : value).replace(/\r\n?/g, '\n').replace(/[\u200B-\u200D\u2060\uFEFF]/g, '');
+    const fenced = text.match(/^\s*```(?:text|txt|markdown|md)?\s*\n([\s\S]*?)\n```\s*$/i);
+    if (fenced) text = fenced[1];
+    return text.split('\n').map(line => line.replace(/[\t ]+$/g, '')).join('\n').replace(/\n{4,}/g, '\n\n\n').trim();
+  }
+
+  function normalizeAiReviewInbox(room) {
+    if (!room || typeof room !== 'object') return [];
+    const normalizeDate = value => {
+      const numeric = Number(value);
+      if (Number.isFinite(numeric) && numeric > 0) return new Date(numeric).toISOString();
+      const parsed = Date.parse(String(value || ''));
+      return Number.isFinite(parsed) ? new Date(parsed).toISOString() : nowIso();
+    };
+    const seen = new Set();
+    room.aiReviewInbox = (Array.isArray(room.aiReviewInbox) ? room.aiReviewInbox : [])
+      .filter(item => item && typeof item === 'object' && String(item.jobId || '').trim() && String(item.result || '').trim())
+      .map(item => {
+        const result = String(item.result || '').trim();
+        const resultHash = String(item.resultHash || simpleHash(result));
+        const status = ['pending','applied','dismissed'].includes(String(item.status)) ? String(item.status) : 'pending';
+        return {
+          version:1,
+          bridge:WISH_RP_BRIDGE_NAME,
+          jobId:String(item.jobId || ''),
+          roomId:String(item.roomId || room.chatId || ''),
+          storyId:String(item.storyId || ''),
+          episodeId:String(item.episodeId || room.apiChatId || ''),
+          taskType:String(item.taskType || 'result'),
+          taskLabel:String(item.taskLabel || item.taskType || 'AI 결과'),
+          sourceCheckpoint:String(item.sourceCheckpoint || ''),
+          createdAt:normalizeDate(item.createdAt || item.receivedAt || nowIso()),
+          receivedAt:normalizeDate(item.receivedAt || item.createdAt || nowIso()),
+          result,
+          resultHash,
+          autoApply:!!item.autoApply,
+          destination:String(item.destination || 'review'),
+          conversationUrl:String(item.conversationUrl || ''),
+          status,
+          appliedAt:String(item.appliedAt || ''),
+          dismissedAt:String(item.dismissedAt || ''),
+          editedAt:String(item.editedAt || ''),
+        };
+      })
+      .sort((a, b) => String(b.receivedAt).localeCompare(String(a.receivedAt)))
+      .filter(item => {
+        const key = `${item.jobId}:${item.resultHash}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .slice(0, AI_REVIEW_INBOX_LIMIT);
+    return room.aiReviewInbox;
+  }
+
+  function aiReviewPendingCount(room) {
+    return normalizeAiReviewInbox(room).filter(item => item.status === 'pending').length;
+  }
+
+  function dispatchWishBridgeStatus(detail) {
+    try {
+      document.dispatchEvent(new CustomEvent(WISH_RP_BRIDGE_STATUS_EVENT, { detail:JSON.stringify(detail || {}) }));
+    } catch (error) {
+      console.warn('[위시RPManager] AI 브리지 상태 전송 실패', error);
+    }
+  }
+
+  function requestWishBridgeReplay() {
+    dispatchWishBridgeStatus({ status:'request-replay', requestedAt:Date.now(), managerVersion:APP.version });
+  }
+
+  function parseWishBridgePayload(raw) {
+    let payload = raw;
+    if (typeof payload === 'string') payload = JSON.parse(payload);
+    if (!payload || typeof payload !== 'object') throw new Error('결과 데이터가 비어 있습니다.');
+    if (Number(payload.version) !== 1 || String(payload.bridge || '') !== WISH_RP_BRIDGE_NAME) throw new Error('지원하지 않는 브리지 형식입니다.');
+    const jobId = String(payload.jobId || '').trim();
+    const result = cleanedPastedText(payload.result);
+    const taskType = String(payload.taskType || 'result').trim();
+    if (!jobId || !result) throw new Error('작업 ID 또는 결과 본문이 없습니다.');
+    if (['memory1','memory2'].includes(taskType) || String(payload.destination || '') === 'none') return null;
+    const createdAtNumber = Number(payload.createdAt);
+    const createdAtParsed = Date.parse(String(payload.createdAt || ''));
+    const createdAt = Number.isFinite(createdAtNumber) && createdAtNumber > 0
+      ? new Date(createdAtNumber).toISOString()
+      : Number.isFinite(createdAtParsed) ? new Date(createdAtParsed).toISOString() : nowIso();
+    return {
+      version:1,
+      bridge:WISH_RP_BRIDGE_NAME,
+      jobId,
+      roomId:String(payload.roomId || payload.episodeId || ''),
+      storyId:String(payload.storyId || ''),
+      episodeId:String(payload.episodeId || ''),
+      taskType,
+      taskLabel:String(payload.taskLabel || taskType || 'AI 결과'),
+      sourceCheckpoint:String(payload.sourceCheckpoint || ''),
+      createdAt,
+      receivedAt:nowIso(),
+      result,
+      resultHash:String(payload.resultHash || simpleHash(result)),
+      autoApply:!!payload.autoApply,
+      destination:String(payload.destination || 'review'),
+      conversationUrl:String(payload.conversationUrl || ''),
+      status:'pending',
+      appliedAt:'',
+      dismissedAt:'',
+    };
+  }
+
+  async function receiveWishBridgePayload(raw) {
+    const incoming = parseWishBridgePayload(raw);
+    if (!incoming) return;
+    state.wishBridgeAvailable = true;
+    const targetKey = String(incoming.roomId || incoming.episodeId || state.currentChatId || '');
+    if (!targetKey) throw new Error('결과를 저장할 RP 방 ID가 없습니다.');
+    const currentApiId = state.currentRoom ? String(apiChatIdOf(state.currentRoom) || '') : '';
+    const exactCurrent = state.currentRoom && (String(state.currentRoom.chatId) === targetKey || currentApiId === targetKey || (incoming.episodeId && currentApiId === String(incoming.episodeId)));
+    const room = exactCurrent ? state.currentRoom : await getRoom(targetKey, incoming.episodeId || targetKey.split('::')[0]);
+    const inbox = normalizeAiReviewInbox(room);
+    const sameJobIndex = inbox.findIndex(item => item.jobId === incoming.jobId);
+    let isNew = true;
+    if (sameJobIndex >= 0) {
+      const previous = inbox[sameJobIndex];
+      if (previous.resultHash === incoming.resultHash) {
+        Object.assign(previous, incoming, {
+          result:previous.editedAt ? previous.result : incoming.result,
+          status:previous.status,
+          appliedAt:previous.appliedAt,
+          dismissedAt:previous.dismissedAt,
+          editedAt:previous.editedAt,
+          receivedAt:previous.receivedAt || incoming.receivedAt,
+        });
+        isNew = false;
+      } else {
+        inbox.splice(sameJobIndex, 1, incoming);
+      }
+    } else {
+      inbox.unshift(incoming);
+    }
+    normalizeAiReviewInbox(room);
+    await saveRoom(room);
+    if (isNew) dispatchWishBridgeStatus({ jobId:incoming.jobId, resultHash:incoming.resultHash, status:'received', receivedAt:Date.now(), roomId:room.chatId });
+    if (String(room.chatId) === String(state.currentChatId)) {
+      state.currentRoom = room;
+      renderModalIfOpen();
+      if (isNew) notify(`AI 검토함에 “${incoming.taskLabel}” 결과가 도착했습니다.`, 'success', 4800);
+    }
+  }
+
+  function bindWishAiBridge() {
+    if (state.wishBridgeBound) return;
+    state.wishBridgeBound = true;
+    document.addEventListener(WISH_RP_BRIDGE_STATUS_EVENT, event => {
+      let status = null;
+      try { status = JSON.parse(String(event.detail || '')); } catch (_) { return; }
+      if (status?.status !== 'bridge-ready' || String(status.bridge || '') !== WISH_RP_BRIDGE_NAME) return;
+      if (state.wishBridgeAvailable) return;
+      state.wishBridgeAvailable = true;
+      renderModalIfOpen();
+    });
+    document.addEventListener(WISH_RP_BRIDGE_EVENT, event => {
+      state.wishBridgeQueue = state.wishBridgeQueue
+        .then(() => receiveWishBridgePayload(event.detail))
+        .catch(error => {
+          console.warn('[위시RPManager] AI 브리지 결과 수신 실패', error);
+          notify(`AI 검토함 수신 실패: ${error.message}`, 'error', 6500);
+        });
+    });
+    const replayDelays = [0, 900, 3200, 10000];
+    state.wishBridgeReplayTimers = replayDelays.map(delay => setTimeout(requestWishBridgeReplay, delay));
+    window.addEventListener('pageshow', requestWishBridgeReplay);
+  }
+
+  function aiReviewTarget(item) {
+    const destination = String(item?.destination || '');
+    if (destination === 'rp:currentState') return 'currentState';
+    if (destination === 'rp:logSummary') return 'logSummary';
+    if (destination === 'rp:timeline') return 'timeline';
+    return String(item?.taskType || '');
+  }
+
+  function aiReviewTaskCanApply(item) {
+    return ['currentState','logSummary'].includes(aiReviewTarget(item));
+  }
+
+  async function applyAiReviewInboxItem(room, item) {
+    const taskType = aiReviewTarget(item);
+    const text = cleanedPastedText(item?.result);
+    const cursor = aiSummaryCursorSnapshot(room);
+    room.aiSummaryUndo = {
+      logSummary:String(aiFixedSlot(room, 'logSummary')?.content || ''),
+      currentState:String(aiFixedSlot(room, 'currentState')?.content || ''),
+      cursorKey:String(cursor.cursorKey || ''),
+      cursorAt:String(cursor.cursorAt || ''),
+      cursorKeys:{ ...(cursor.cursorKeys || {}) },
+      cursorAts:{ ...(cursor.cursorAts || {}) },
+      savedAt:nowIso(),
+    };
+    if (taskType === 'currentState') {
+      const checked = validateGeneratedCurrentState(text);
+      if (checked.errors.length) throw new Error(checked.errors.join('\n'));
+      const slot = aiFixedSlot(room, 'currentState');
+      if (!slot) throw new Error('현재상태 저장칸을 찾지 못했습니다.');
+      slot.content = checked.text;
+      if (room.pending) await syncEditedSlotIntoPending(room, slot, 'ai-review-inbox-current-state');
+    } else if (taskType === 'logSummary') {
+      const slot = aiFixedSlot(room, 'logSummary');
+      const merged = mergeGeneratedLogText(room, text);
+      slot.content = merged.text;
+      remapLogSelectionKeys(room, merged.byOldKey, merged.newBlocks);
+      if (room.pending) await syncEditedSlotIntoPending(room, slot, 'ai-review-inbox-log-summary');
+    } else {
+      throw new Error('이 작업 종류는 자동 적용하지 않습니다. 결과를 복사해 필요한 화면에서 확인해 주세요.');
+    }
+    item.status = 'applied';
+    item.appliedAt = nowIso();
+    item.dismissedAt = '';
+    await saveRoom(room);
+    dispatchWishBridgeStatus({ jobId:item.jobId, resultHash:item.resultHash, status:'applied', appliedAt:Date.now(), roomId:room.chatId });
+    renderModalIfOpen();
+  }
+
+  function compactAiReviewListSpacing(value) {
+    const lines = String(value == null ? '' : value).replace(/\r\n?/g, '\n').split('\n');
+    const isListLine = line => /^\s*(?:[-*+•‣▪▫◦]\s+\S|\d+[.)]\s+\S)/.test(String(line || ''));
+    const result = [];
+    for (let index = 0; index < lines.length; index++) {
+      if (lines[index].trim()) {
+        result.push(lines[index]);
+        continue;
+      }
+      let nextIndex = index;
+      while (nextIndex < lines.length && !lines[nextIndex].trim()) nextIndex++;
+      const previous = [...result].reverse().find(line => String(line || '').trim()) || '';
+      const next = lines[nextIndex] || '';
+      if (isListLine(previous) && isListLine(next)) {
+        index = nextIndex - 1;
+        continue;
+      }
+      result.push(lines[index]);
+    }
+    return result.join('\n');
+  }
+
+  function openAiReviewInboxDialog(room, preferredJobId = '') {
+    document.querySelector('#rpcm-ai-review-backdrop')?.remove();
+    normalizeAiReviewInbox(room);
+    let selectedId = preferredJobId || room.aiReviewInbox.find(item => item.status === 'pending')?.jobId || room.aiReviewInbox[0]?.jobId || '';
+    const backdrop = document.createElement('div');
+    backdrop.id = 'rpcm-ai-review-backdrop';
+    const editorDrafts = new Map();
+    let editorSaveTimer = null;
+
+    const selectedItem = () => normalizeAiReviewInbox(room).find(item => item.jobId === selectedId) || room.aiReviewInbox[0] || null;
+    const dateLabel = value => {
+      try { return new Date(value).toLocaleString('ko-KR'); } catch (_) { return String(value || ''); }
+    };
+    const statusLabel = status => status === 'applied' ? '적용됨' : status === 'dismissed' ? '검토 완료' : '검토 대기';
+    const setEditorStatus = (text, tone = '') => {
+      const status = backdrop.querySelector('[data-review-edit-status]');
+      if (!status) return;
+      status.textContent = text;
+      status.dataset.tone = tone;
+    };
+    const editorValueFor = item => {
+      if (!item) return '';
+      const editor = backdrop.querySelector('[data-review-editor]');
+      if (editor && String(editor.dataset.reviewEditorJob || '') === String(item.jobId || '')) return editor.value;
+      if (editorDrafts.has(item.jobId)) return editorDrafts.get(item.jobId);
+      return String(item.result || '');
+    };
+    const saveEditorValue = async (jobId, value, announce = false) => {
+      clearTimeout(editorSaveTimer);
+      editorSaveTimer = null;
+      const item = normalizeAiReviewInbox(room).find(row => String(row.jobId) === String(jobId));
+      if (!item) return false;
+      const cleaned = cleanedPastedText(value);
+      if (!cleaned) {
+        setEditorStatus('내용은 비워둘 수 없습니다.', 'error');
+        if (announce) notify('결과 내용은 비워둘 수 없습니다.', 'warn');
+        return false;
+      }
+      if (cleaned !== item.result) {
+        item.result = cleaned;
+        item.editedAt = nowIso();
+        await saveRoom(room);
+        renderModalIfOpen();
+      }
+      editorDrafts.delete(item.jobId);
+      setEditorStatus('편집 내용 저장됨', 'saved');
+      if (announce) notify('편집한 결과를 검토함에 저장했습니다.', 'success', 3000);
+      return true;
+    };
+    const flushSelectedEditor = async (announce = false) => {
+      const item = selectedItem();
+      if (!item) return true;
+      return saveEditorValue(item.jobId, editorValueFor(item), announce);
+    };
+    const render = () => {
+      const items = normalizeAiReviewInbox(room);
+      const current = selectedItem();
+      const pendingCount = items.filter(item => item.status === 'pending').length;
+      backdrop.innerHTML = `
+        <div class="rpcm-ai-review-dialog" role="dialog" aria-modal="true" aria-label="AI 검토함">
+          <header><div><h2>📥 AI 검토함</h2><p>Wish AI Manager에서 전송한 이 방의 결과입니다. 같은 작업의 재전송은 한 건으로 합쳐집니다.</p></div><button type="button" data-review-action="close" aria-label="닫기" data-rpcm-close="icon">×</button></header>
+          <div class="rpcm-ai-review-summary"><strong>검토 대기 ${pendingCount}건</strong><span>전체 ${items.length}건 · 방별 로컬 보관</span><button type="button" data-review-action="replay">누락 결과 다시 받기</button></div>
+          <div class="rpcm-ai-review-layout">
+            <aside>${items.length ? items.map(item => `<button type="button" class="rpcm-ai-review-row${item.jobId === current?.jobId ? ' active' : ''}" data-review-job="${esc(item.jobId)}"><span class="status-${esc(item.status)}">${esc(statusLabel(item.status))}</span><strong>${esc(item.taskLabel)}</strong><small>${esc(dateLabel(item.createdAt))} · ${formatCount(item.result.length)}자</small></button>`).join('') : '<div class="rpcm-ai-review-empty">아직 받은 결과가 없습니다.<br>‘누락 결과 다시 받기’를 눌러 재전송을 요청할 수 있습니다.</div>'}</aside>
+            <main>${current ? `
+              <div class="rpcm-ai-review-meta"><div><b>${esc(current.taskLabel)}</b><span>${esc(current.taskType)} · ${esc(dateLabel(current.receivedAt))}${current.autoApply ? ' · 자동 적용 요청됨' : ''}${current.editedAt ? ` · 직접 수정 ${esc(dateLabel(current.editedAt))}` : ''}</span></div><span class="status-${esc(current.status)}">${esc(statusLabel(current.status))}</span></div>
+              <textarea data-review-editor data-review-editor-job="${esc(current.jobId)}" spellcheck="false">${esc(editorDrafts.has(current.jobId) ? editorDrafts.get(current.jobId) : current.result)}</textarea>
+              <div class="rpcm-ai-review-edit-note"><span data-review-edit-status>직접 편집 가능 · 변경 내용 자동 저장</span><small>‘목록 빈 줄 정리’는 목록 항목 사이의 빈 줄만 제거합니다.</small></div>
+              <div class="rpcm-ai-review-actions">
+                <button type="button" data-review-action="compact-list">목록 빈 줄 정리</button>
+                <button type="button" data-review-action="save-edit">편집 저장</button>
+                <button type="button" data-review-action="copy">내용 복사</button>
+                ${aiReviewTarget(current) === 'timeline' ? '<button type="button" data-review-action="timeline">타임라인으로 가져오기</button>' : ''}
+                ${aiReviewTaskCanApply(current) ? `<button type="button" class="primary" data-review-action="apply">${current.status === 'applied' ? '수정본 다시 적용' : '이 방에 적용'}</button>` : ''}
+                ${current.status === 'pending' ? '<button type="button" data-review-action="dismiss">검토 완료</button>' : current.status === 'dismissed' ? '<button type="button" data-review-action="restore">대기로 되돌리기</button>' : ''}
+                <button type="button" class="danger" data-review-action="delete">삭제</button>
+              </div>` : '<div class="rpcm-ai-review-detail-empty">왼쪽에서 결과를 선택해 주세요.</div>'}</main>
+          </div>
+        </div>`;
+      const editor = backdrop.querySelector('[data-review-editor]');
+      if (editor && current) editor.addEventListener('input', () => {
+        const jobId = String(editor.dataset.reviewEditorJob || current.jobId || '');
+        editorDrafts.set(jobId, editor.value);
+        setEditorStatus('편집 내용 저장 대기…');
+        clearTimeout(editorSaveTimer);
+        editorSaveTimer = setTimeout(() => {
+          void saveEditorValue(jobId, editor.value).catch(error => {
+            setEditorStatus(`저장 실패 · ${error.message}`, 'error');
+          });
+        }, 650);
+      });
+    };
+
+    const close = async () => {
+      if (!await flushSelectedEditor()) return false;
+      clearTimeout(editorSaveTimer);
+      editorSaveTimer = null;
+      backdrop.remove();
+      return true;
+    };
+    backdrop.addEventListener('click', async event => {
+      const row = event.target.closest('[data-review-job]');
+      if (row) {
+        if (!await flushSelectedEditor()) return;
+        selectedId = String(row.dataset.reviewJob || '');
+        render();
+        return;
+      }
+      const action = event.target.closest('[data-review-action]')?.dataset.reviewAction;
+      if (!action) { if (event.target === backdrop) await close(); return; }
+      if (action === 'close') { await close(); return; }
+      if (action === 'replay') { requestWishBridgeReplay(); notify('AI Manager에 보관된 결과 재전송을 요청했습니다.', 'info'); return; }
+      const item = selectedItem();
+      if (!item) return;
+      if (action === 'compact-list') {
+        const editor = backdrop.querySelector('[data-review-editor]');
+        if (!editor) return;
+        const before = editor.value;
+        const after = compactAiReviewListSpacing(before);
+        if (after === before) {
+          notify('정리할 목록 사이 빈 줄이 없습니다.', 'info', 3000);
+          return;
+        }
+        editor.value = after;
+        editorDrafts.set(item.jobId, after);
+        await saveEditorValue(item.jobId, after);
+        notify(`목록 사이 빈 줄 ${Math.max(1, before.split('\n').length - after.split('\n').length)}개를 정리했습니다.`, 'success', 3200);
+        return;
+      }
+      if (action === 'save-edit') {
+        await flushSelectedEditor(true);
+        return;
+      }
+      if (action === 'copy') {
+        const copied = await copyPlainText(editorValueFor(item));
+        notify(copied ? '결과 내용을 복사했습니다.' : '복사하지 못했습니다.', copied ? 'success' : 'error');
+        return;
+      }
+      if (action === 'timeline') {
+        if (!await flushSelectedEditor()) return;
+        const liveItem = selectedItem() || item;
+        if (!await close()) return;
+        await openStoryTimelineManagerDialogV35(room, { initialMode:'api-update', resultText:liveItem.result });
+        openAiReviewInboxDialog(room, liveItem.jobId);
+        return;
+      }
+      if (action === 'apply') {
+        try {
+          event.target.disabled = true;
+          if (!await flushSelectedEditor()) { event.target.disabled = false; return; }
+          const liveItem = selectedItem() || item;
+          await applyAiReviewInboxItem(room, liveItem);
+          notify(`“${liveItem.taskLabel}” 결과를 적용했습니다.`, 'success');
+          render();
+        } catch (error) {
+          notify(`결과 적용 실패: ${error.message}`, 'error', 7000);
+          event.target.disabled = false;
+        }
+        return;
+      }
+      if (action === 'dismiss' || action === 'restore') {
+        if (!await flushSelectedEditor()) return;
+        const liveItem = selectedItem() || item;
+        liveItem.status = action === 'dismiss' ? 'dismissed' : 'pending';
+        liveItem.dismissedAt = action === 'dismiss' ? nowIso() : '';
+        await saveRoom(room);
+        renderModalIfOpen(); render(); return;
+      }
+      if (action === 'delete') {
+        if (!confirm('이 결과를 검토함에서 삭제할까요?')) return;
+        editorDrafts.delete(item.jobId);
+        room.aiReviewInbox = normalizeAiReviewInbox(room).filter(rowItem => rowItem.jobId !== item.jobId);
+        selectedId = room.aiReviewInbox[0]?.jobId || '';
+        await saveRoom(room);
+        renderModalIfOpen(); render();
+      }
+    });
+    backdrop.addEventListener('keydown', event => {
+      if (event.key === 'Escape') void close().catch(error => notify(`편집 내용 저장 실패: ${error.message}`, 'error', 5000));
+    });
+    document.body.appendChild(backdrop);
+    render();
+  }
+
+  async function copyPlainText(value) {
+    const text = String(value || '');
+    if (!text) return false;
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch (_) {}
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      ta.style.pointerEvents = 'none';
+      document.body.appendChild(ta);
+      ta.focus(); ta.select();
+      const ok = document.execCommand('copy');
+      ta.remove();
+      return !!ok;
+    } catch (_) { return false; }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Optional external-AI summary beta
+  // ---------------------------------------------------------------------------
+
+  function aiSecretKey(provider) {
+    return `${AI_SECRET_PREFIX}${String(provider || '')}`;
+  }
+
+  function readAiSecret(provider) {
+    try { return String(GM_getValue(aiSecretKey(provider), '') || ''); }
+    catch (_) { return ''; }
+  }
+
+  function writeAiSecret(provider, value) {
+    const text = String(value || '');
+    try {
+      if (text) GM_setValue(aiSecretKey(provider), text);
+      else GM_deleteValue(aiSecretKey(provider));
+      return true;
+    } catch (_) { return false; }
+  }
+
+  function loadAiSummarySettings() {
+    const defaults = {
+      provider:'gemini',
+      models:Object.fromEntries(AI_SUMMARY_PROVIDERS.map(id => [id, AI_SUMMARY_PROVIDER_DEFAULTS[id].model])),
+      openaiBaseUrl:'',
+      vertexLocation:'global',
+      vertexProjectId:'',
+      turnCount:30,
+      preferUnprocessed:true,
+      targets:{ logSummary:true, currentState:true },
+      featureModels:{
+        summary:{ provider:'gemini', model:AI_SUMMARY_PROVIDER_DEFAULTS.gemini.model },
+        timeline:{ provider:'gemini', model:AI_SUMMARY_PROVIDER_DEFAULTS.gemini.model },
+        context:{ provider:'gemini', model:AI_SUMMARY_PROVIDER_DEFAULTS.gemini.model },
+        itemFolder:{ provider:'gemini', model:AI_SUMMARY_PROVIDER_DEFAULTS.gemini.model },
+        utility:{ provider:'gemini', model:AI_SUMMARY_PROVIDER_DEFAULTS.gemini.model },
+      },
+      featureStatus:{},
+    };
+    try {
+      let raw='';
+      try { raw=localStorage.getItem(AI_SUMMARY_SETTINGS_KEY)||''; } catch (_) {}
+      if(!raw){try{raw=String(GM_getValue(AI_SUMMARY_SETTINGS_KEY,'')||'');}catch(_){}}
+      const saved = JSON.parse(raw || 'null');
+      if (!saved || typeof saved !== 'object') return defaults;
+      const provider = AI_SUMMARY_PROVIDERS.includes(saved.provider) ? saved.provider : defaults.provider;
+      const models = { ...defaults.models, ...(saved.models && typeof saved.models === 'object' ? saved.models : {}) };
+      const legacyModel = String(models[provider] || AI_SUMMARY_PROVIDER_DEFAULTS[provider]?.model || '');
+      const normalizeFeature = feature => {
+        const raw = saved.featureModels?.[feature];
+        const featureProvider = AI_SUMMARY_PROVIDERS.includes(raw?.provider) ? raw.provider : provider;
+        return { provider:featureProvider, model:String(raw?.model || models[featureProvider] || legacyModel) };
+      };
+      return {
+        provider,
+        models,
+        openaiBaseUrl:String(saved.openaiBaseUrl || ''),
+        vertexLocation:String(saved.vertexLocation || 'global'),
+        vertexProjectId:String(saved.vertexProjectId || ''),
+        turnCount:Number(saved.turnCount) === 0 ? 0 : Math.max(1, Math.min(100, Number(saved.turnCount) || 30)),
+        preferUnprocessed:saved.preferUnprocessed !== false,
+        targets:{
+          logSummary:saved.targets?.logSummary !== false,
+          currentState:saved.targets?.currentState !== false,
+        },
+        featureModels:{ summary:normalizeFeature('summary'), timeline:normalizeFeature('timeline'), context:normalizeFeature('context'), itemFolder:normalizeFeature('itemFolder'), utility:normalizeFeature('utility') },
+        featureStatus:saved.featureStatus && typeof saved.featureStatus === 'object' ? saved.featureStatus : {},
+      };
+    } catch (_) { return defaults; }
+  }
+
+  function saveAiSummarySettings(settings) {
+    const next = loadAiSummarySettings();
+    Object.assign(next, settings || {});
+    if (settings?.models) next.models = { ...next.models, ...settings.models };
+    if (settings?.targets) next.targets = { ...next.targets, ...settings.targets };
+    if (settings?.featureModels) next.featureModels = { ...next.featureModels, ...settings.featureModels };
+    if (settings?.featureStatus) next.featureStatus = { ...next.featureStatus, ...settings.featureStatus };
+    next.provider = AI_SUMMARY_PROVIDERS.includes(next.provider) ? next.provider : 'gemini';
+    next.turnCount = Number(next.turnCount) === 0 ? 0 : Math.max(1, Math.min(100, Number(next.turnCount) || 30));
+    const serialized=JSON.stringify(next);
+    let localError=null;
+    try { localStorage.setItem(AI_SUMMARY_SETTINGS_KEY, serialized); }
+    catch (error) { localError=error; }
+    try { GM_setValue(AI_SUMMARY_SETTINGS_KEY, serialized); }
+    catch (gmError) { if(localError) throw new Error(`AI 설정 저장 실패: 브라우저 저장공간과 확장 저장공간을 모두 사용할 수 없습니다. ${localError?.message||localError}; ${gmError?.message||gmError}`); }
+    return next;
+  }
+
+  function aiFeatureSettings(settings, feature) {
+    const base = settings || loadAiSummarySettings();
+    const selected = base.featureModels?.[feature] || { provider:base.provider, model:base.models?.[base.provider] };
+    const provider = AI_SUMMARY_PROVIDERS.includes(selected.provider) ? selected.provider : base.provider;
+    return { ...base, provider, models:{ ...base.models, [provider]:String(selected.model || base.models?.[provider] || AI_SUMMARY_PROVIDER_DEFAULTS[provider]?.model || '') } };
+  }
+
+  // 저장된 성공/오류 상태는 그때 실제로 사용한 provider+model과 현재 선택이 같을 때만 유효합니다.
+  // 모델을 바꿨는데 과거 오류가 계속 빨갛게 남는 stale status를 방지합니다.
+  function aiFeatureCurrentStatus(settings, feature, providerOverride = '', modelOverride = '') {
+    const base = settings || loadAiSummarySettings();
+    const cfg = aiFeatureSettings(base, feature);
+    const provider = String(providerOverride || cfg.provider || '');
+    const model = String(modelOverride || cfg.models?.[provider] || '');
+    const status = base.featureStatus?.[feature];
+    if (!status || typeof status !== 'object') return null;
+    return String(status.provider || '') === provider && String(status.model || '') === model ? status : null;
+  }
+
+  function aiFeatureStatusLabel(feature) {
+    return feature === 'semanticIndex' ? '의미 검색 준비' : feature === 'semanticQuery' ? '의미 검색 query' : feature === 'longTermManualFirst' ? '장기기억 1차 수동' : feature === 'longTermAutoFirst' ? '장기기억 1차 자동' : feature === 'longTermSecond' ? '장기기억 2차' : feature === 'longTermNative' ? 'native 장기기억 정리' : feature === 'timeline' ? '연속성 타임라인' : feature === 'context' ? 'AI 맥락 검토' : feature === 'itemFolder' ? '중요 물품 폴더 정리' : feature === 'utility' ? 'AI 어시스턴트' : feature === 'responseRefiner' ? '응답교정' : 'AI 요약';
+  }
+
+  function classifyAiFailure(error) {
+    const detail = String(error?.message || error || '알 수 없는 오류');
+    const lower = detail.toLowerCase();
+    let category = '기타 오류';
+    if (/quotaexceedederror|storage quota|dom exception.*quota|the quota has been exceeded/.test(lower)) category = '브라우저 저장공간 오류';
+    else if (/app.?check|firebaseappcheck|attestation|recaptcha enterprise/.test(lower)) category = 'Firebase App Check 인증';
+    else if (/429|resource exhausted|rate.?limit|api quota|requests per|tokens per/.test(lower)) category = 'API 사용량 제한';
+    else if (/firebase|api.?key|설정 코드|configuration/.test(lower)) category = 'Firebase 설정 오류';
+    else if (/network|fetch|연결|timeout|timed out|cors/.test(lower)) category = '네트워크 오류';
+    else if (/model|not found|unsupported|지원하지/.test(lower)) category = '모델 사용 불가';
+    else if (/max_tokens|finish.?reason.*length|출력 한도|출력이? .*끊|응답이? .*끊|incomplete/.test(lower)) category = '출력 한도 초과';
+    else if (/token|too large|maximum|입력 한도|context length/.test(lower)) category = '입력 한도 초과';
+    else if (/json|response format|응답 형식/.test(lower)) category = '응답 형식 오류';
+    else if (/parse|파싱/.test(lower)) category = '응답 파싱 실패';
+    else if (/401|403|unauthorized|forbidden|인증/.test(lower)) category = 'API 연결 실패';
+    else if (/api|호출|generation|generate/.test(lower)) category = '모델 호출 실패';
+    return { category, detail };
+  }
+
+  function setAiFeatureStatus(feature, stateName, provider, model, message = '', detail = '', extra = {}) {
+    const settings = aiFeatureSettings(loadAiSummarySettings(), 'summary');
+    settings.featureStatus = {
+      ...(settings.featureStatus || {}),
+      [feature]:{ ...(settings.featureStatus?.[feature]?.lastRun ? { lastRun:settings.featureStatus[feature].lastRun } : {}), state:stateName, provider:String(provider || ''), model:String(model || ''), message:String(message || ''), detail:String(detail || ''), checkedAt:nowIso(), ...(extra && typeof extra === 'object' ? extra : {}) },
+    };
+    saveAiSummarySettings(settings);
+    return settings.featureStatus[feature];
+  }
+
+  function loadAiSummaryUsage() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(AI_SUMMARY_USAGE_KEY) || 'null');
+      if (saved && typeof saved === 'object') return {
+        ...saved,
+        calls:Math.max(0, Number(saved.calls) || 0),
+        inputTokens:Math.max(0, Number(saved.inputTokens) || 0),
+        outputTokens:Math.max(0, Number(saved.outputTokens) || 0),
+        estimatedCostUsd:Math.max(0, Number(saved.estimatedCostUsd) || 0),
+        pricedCalls:Math.max(0, Number(saved.pricedCalls) || 0),
+      };
+    } catch (_) {}
+    return { calls:0, inputTokens:0, outputTokens:0, estimatedCostUsd:0, pricedCalls:0, last:null };
+  }
+
+  function defaultAiPricing(provider, model) {
+    const providerId = String(provider || '').toLowerCase();
+    const google = ['gemini','firebase','vertex'].includes(providerId);
+    const name = String(model || '').trim().toLowerCase();
+    if (providerId === 'openai') {
+      if (/^gpt-6-astra(?:$|-)/.test(name)) {
+        return { inputPerMillion:10.00, outputPerMillion:50.00, source:'OpenAI 공식 기본 단가' };
+      }
+      if (/^gpt-5\.6-terra(?:$|-)/.test(name)) {
+        return { inputPerMillion:2.00, outputPerMillion:12.00, source:'OpenAI 공식 기본 단가' };
+      }
+      if (/^gpt-5\.6-luna(?:$|-)/.test(name)) {
+        return { inputPerMillion:0.20, outputPerMillion:1.20, source:'OpenAI 공식 기본 단가' };
+      }
+      if (/^(?:gpt-5\.6|gpt-5\.6-sol)(?:$|-)/.test(name)) {
+        return { inputPerMillion:4.00, outputPerMillion:20.00, source:'OpenAI 공식 기본 단가' };
+      }
+    }
+    if (google && /^gemini-3\.8-flash(?:$|-)/.test(name)) {
+      return { inputPerMillion:0.75, outputPerMillion:3.75, source:'Google 공식 Standard 단가 · 2026-12-31까지' };
+    }
+    if (google && /^gemini-3\.7-flash(?:$|-)/.test(name)) {
+      return { inputPerMillion:0.75, outputPerMillion:3.75, source:'Google 공식 global 단가 · 2026-12-31까지' };
+    }
+    if (google && /^gemini-3\.5-flash-lite(?:$|-)/.test(name)) {
+      return { inputPerMillion:0.30, outputPerMillion:2.50, source:'Google 공식 global 단가' };
+    }
+    if (google && /^gemini-3\.5-flash(?:$|-)/.test(name)) {
+      return { inputPerMillion:1.50, outputPerMillion:9.00, source:'Google 공식 global 단가' };
+    }
+    if (google && /^gemini-3\.1-flash-lite(?:$|-)/.test(name)) {
+      return { inputPerMillion:0.25, outputPerMillion:1.50, source:'Google 공식 global 단가' };
+    }
+    if (google && /^gemini-3\.1-pro-preview(?:$|-)/.test(name)) {
+      return { inputPerMillion:2.00, outputPerMillion:12.00, source:'Google 공식 global 단가 · 입력 20만 토큰 이하' };
+    }
+    if (google && /^gemini-2\.5-flash-lite(?:$|-)/.test(name)) {
+      return { inputPerMillion:0.10, outputPerMillion:0.40, source:'Google 공식 기본 단가' };
+    }
+    if (google && /^gemini-2\.5-flash(?:$|-)/.test(name) && !/(?:image|tts|native-audio)/.test(name)) {
+      return { inputPerMillion:0.30, outputPerMillion:2.50, source:'Google 공식 기본 단가' };
+    }
+    if (google && /^gemini-2\.5-pro(?:$|-)/.test(name)) {
+      return { inputPerMillion:1.25, outputPerMillion:10.00, source:'Google 공식 기본 단가 · 입력 20만 토큰 이하' };
+    }
+    return { inputPerMillion:null, outputPerMillion:null, source:'자동 단가 정보 없음' };
+  }
+
+  function isOfficialOpenAiBaseUrl(value) {
+    try {
+      const url = new URL(String(value || '').trim());
+      return url.hostname.toLowerCase() === 'api.openai.com';
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function getAiPricing(settings, provider, model) {
+    if (String(provider || '').toLowerCase() === 'openai' && !isOfficialOpenAiBaseUrl(settings?.openaiBaseUrl)) {
+      return { inputPerMillion:null, outputPerMillion:null, source:'OpenAI 호환 API · 단가 직접 확인 필요' };
+    }
+    return defaultAiPricing(provider, model);
+  }
+
+  function estimateAiCostUsd(usage = {}, pricing = {}) {
+    if (pricing.inputPerMillion == null || pricing.inputPerMillion === '' || pricing.outputPerMillion == null || pricing.outputPerMillion === '') return null;
+    const inputRate = Number(pricing.inputPerMillion);
+    const outputRate = Number(pricing.outputPerMillion);
+    if (!Number.isFinite(inputRate) || inputRate < 0 || !Number.isFinite(outputRate) || outputRate < 0) return null;
+    const inputTokens = Math.max(0, Number(usage.inputTokens) || 0);
+    const outputTokens = Math.max(0, Number(usage.outputTokens) || 0);
+    return (inputTokens * inputRate + outputTokens * outputRate) / 1000000;
+  }
