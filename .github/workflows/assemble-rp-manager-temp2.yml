@@ -19,7 +19,13 @@ jobs:
         run: |
           set -euo pipefail
           out="RP_Manager_0.17.14_TEMP2_ERROR_HELP.user.js"
-          cat .upload/rp_manager_temp2/part_* > "$out"
+          : > "$out"
+          for f in .upload/rp_manager_temp2/part_*; do
+            cat "$f" >> "$out"
+            if [[ "$f" != ".upload/rp_manager_temp2/part_042" ]]; then
+              printf '\r\n' >> "$out"
+            fi
+          done
           test "$(wc -c < "$out")" -eq 4966836
           echo "ef272417ce692ca06593637b76da208cd9c34c1aac9dd025ab1e24b8f9476a49  $out" | sha256sum -c -
           rm -rf .upload/rp_manager_temp2
