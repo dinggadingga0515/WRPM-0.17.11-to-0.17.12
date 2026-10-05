@@ -1,0 +1,1000 @@
+  function buildContextText(messages, target) {
+    const turns = Math.max(0, Math.min(truncationOnly()?2:12,Number(settings.contextTurns)||0));
+    if (!turns) return '최근 대화 내역 없음.';
+    let ctx = messages.slice();
+    const targetIndex=target?ctx.findIndex(m=>String(m.id)===String(target.id)):-1;
+    if(targetIndex>=0)ctx=ctx.slice(0,targetIndex);
+    else if(target?.id)return '대상 응답 이전 대화를 조회 범위에서 찾지 못했습니다. 이후 대화는 근거로 사용하지 않습니다.';
+    ctx = ctx.slice(-(2 * turns + 1));
+    if (!ctx.length) return '최근 대화 내역 없음.';
+    const texts=ctx.map(m=>stripUserInjectedNotes(m.content));
+    const budgets=reviewTextBudgets(texts,truncationOnly()?12000:fastReview()?12000:24000,truncationOnly()?4500:fastReview()?6000:10000);
+    return ctx.map((m,index)=>{
+      const text=texts[index],budget=budgets[index];
+      // 마지막 행동뿐 아니라 응답 첫머리의 완료된 상태 전환도 참고자료에 남깁니다.
+      const head=Math.floor(budget*.35),tail=budget-head;
+      const excerpt=text.length<=budget?text:text.slice(0,head)+`\n[중간 ${text.length-budget}자 생략; 회수되지 않은 사건은 확인 불가]\n`+text.slice(-tail);
+      return `${m.role} [message ${m.id||index}]: ${excerpt}`;
+    }).join('\n\n');
+  }
+
+  function fillPrompt(template, values) {
+    let out = String(template || '');
+    const replacements = {
+      '{core}': values.core,
+      '{currentState}': values.currentState,
+      '{dateLogs}': values.dateLogs,
+      '{characters}': values.characters,
+      '{extras}': values.extras,
+      '{lore}': values.lore,
+      '{memory}': [values.currentState, values.dateLogs].join('\n\n'),
+      '{actors}': values.actors,
+      '{relationships}': values.relationships,
+      '{speech}': values.speech,
+      '{timeline}':values.timeline,
+      '{longTerm}':values.longTerm,
+      '{structuralHints}':values.structuralHints,
+      '{formatReference}':values.formatReference,
+      '{context}': values.context,
+      '{message}': values.message,
+      '{passWord}': 'PASS',
+    };
+    out=out.replace(/\{(?:core|currentState|dateLogs|characters|extras|lore|memory|actors|relationships|speech|timeline|longTerm|structuralHints|formatReference|context|message|passWord)\}/g,key=>String(replacements[key]??''));
+    if(settings.template==='custom')out+='\n\n[ACTIVE_REVIEW_CONTRACT · overrides conflicting template instructions]\n'+(truncationOnly()?'Your ONLY job is to detect and repair clear output truncation. Do not change any other sentence.\n':'')+reviewCheckInstructions()+'\n'+REVIEW_OUTPUT_CONTRACT+'\nOnly the enabled categories can produce corrections. Disabled checks must not affect verdicts.\n';
+    if(settings.template==='custom'&&!String(template).includes('{formatReference}')&&!truncationOnly())out+='\n[OUTPUT_FORMAT_REFERENCE]\n'+String(values.formatReference||'');
+    return out + `\n\nTARGET BOUNDARY: [New Speech] is the only text you may correct. RP Manager references and [Recent Context] are reference data and are never correction targets. Never return, rewrite, or substitute a user message as refined_text. Every issues[].replacements[].from or legacy replacements[].from MUST be a non-empty exact substring of [New Speech]. Each logical issue must be independently applicable to the ORIGINAL [New Speech]; no selected issue may depend on another issue having been applied first. FORMAT PRESERVATION: for ordinary corrections, preserve the original paragraph boundaries, newline count, blank-line pattern, Markdown markers, and status-block layout of the targeted from range. Change only the erroneous content. Do not reflow, prettify, or insert extra blank lines. Only a repair that inherently requires missing structure, such as a missing required INFO/HUD block, a missing bilingual line, or confirmed narration/dialogue marker damage, may restore only the minimum necessary lines or markers. If [New Speech] needs no change, return the appropriate JSON verdict; PASS only when no supported issue exists.`;
+  }
+
+  function parseGeminiText(json) {
+    const candidates = Array.isArray(json?.candidates) ? json.candidates : [];
+    for (const candidate of candidates) {
+      const parts = candidate?.content?.parts;
+      if (!Array.isArray(parts)) continue;
+      const text = parts.filter(p => !p?.thought).map(p => typeof p?.text === 'string' ? p.text : '').join('');
+      if (text) return text;
+    }
+    return '';
+  }
+
+  function fastReview(config=settings){return (activeReviewMode||config.reviewMode)!=='normal';}
+
+  function selectedThinkingLevel(test = false) {
+    // 연결 테스트는 reasoning 때문에 512 토큰을 다 써 빈 응답이 되는 일을 피하도록 low로 고정합니다.
+    return test ? 'low' : normalizeThinkingLevel(settings.responseRefinerThinkingLevel);
+  }
+
+  function generationConfig(test = false) {
+    // Gemini 3.8/3.7 공식 권고에 따라 temperature/topP/topK/candidateCount/thinkingBudget은 넣지 않습니다.
+    return {
+      maxOutputTokens: test ? 2048 : 32768,
+      thinkingConfig: { thinkingLevel: selectedThinkingLevel(test) },
+    };
+  }
+
+  function firebaseGenerationConfig(firebase, test = false) {
+    const config = generationConfig(test);
+    const level = selectedThinkingLevel(test);
+    const enumValue = firebase?.ThinkingLevel?.[level.toUpperCase()];
+    config.thinkingConfig.thinkingLevel = enumValue ?? level;
+    return config;
+  }
+
+  async function callAiStudio(prompt, { test = false } = {}) {
+    const key = getApiKey();
+    if (!key) throw new Error('Gemini API Key가 없습니다.');
+    const body = {
+      safetySettings: SAFETY,
+      contents: [{ role:'user', parts:[{ text:String(prompt || '') }] }],
+      generationConfig: generationConfig(test),
+    };
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${currentModelId()}:generateContent`;
+    let lastError = '';
+    let lastErrorDetails = '';
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const res = await gmRequest(url, {
+          method:'POST',
+          headers:{ 'Content-Type':'application/json', 'x-goog-api-key':key },
+          body:JSON.stringify(body),
+          timeout:test ? 60000 : 120000,
+        });
+        let json = null;
+        try { json = JSON.parse(res.responseText || ''); } catch (_) {}
+        if (res.status >= 200 && res.status < 300) {
+          const text = parseGeminiText(json);
+          if (text) return { text, json, provider:'ai-studio' };
+          lastError = `AI 응답이 비어 있음${json?.candidates?.[0]?.finishReason ? ` (${json.candidates[0].finishReason})` : ''}`;
+          lastErrorDetails = JSON.stringify(json || {}, null, 2) || lastError;
+        } else {
+          const full = String(res.responseText || '');
+          lastError = `Gemini HTTP ${res.status}: ${full.slice(0, 280)}`;
+          lastErrorDetails = `Gemini HTTP ${res.status}\n${full || '(응답 본문 없음)'}`;
+          if ([400,401,403,404].includes(res.status)) break;
+        }
+      } catch (e) {
+        lastError = e.message || String(e);
+        lastErrorDetails = formatErrorDetails(e);
+      }
+      if (attempt === 0) await sleep(1200);
+    }
+    const error = new Error(lastError || 'Gemini API 호출 실패');
+    error.fullDetails = lastErrorDetails || lastError || 'Gemini API 호출 실패';
+    throw error;
+  }
+
+  function parseFirebaseConfigInput(input) {
+    const raw = String(input || '').trim();
+    if (!raw) return null;
+    let source = raw.replace(/^\s*(?:const|let|var)\s+firebaseConfig\s*=\s*/i, '').replace(/;\s*$/g, '').trim();
+    const objectMatch = source.match(/\{[\s\S]*\}/);
+    if (objectMatch) source = objectMatch[0];
+    try {
+      const parsed = JSON.parse(source);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+    } catch (_) {}
+    const fields = ['apiKey','authDomain','databaseURL','projectId','storageBucket','messagingSenderId','appId','measurementId'];
+    const parsed = {};
+    for (const field of fields) {
+      const escaped = field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const pattern = new RegExp(String.raw`(?:^|[,\{\s])(?:["']?${escaped}["']?)\s*:\s*(["'])((?:\\.|(?!\1)[\s\S])*?)\1`);
+      const match = source.match(pattern);
+      if (!match) continue;
+      let v = match[2].replace(/\\n/g,'\n').replace(/\\r/g,'\r').replace(/\\t/g,'\t').replace(/\\\\/g,'\\');
+      v = match[1] === '"' ? v.replace(/\\"/g,'"') : v.replace(/\\'/g,"'");
+      parsed[field] = v;
+    }
+    if (Object.keys(parsed).length) return parsed;
+    throw new Error('Firebase Config를 읽지 못했습니다. const firebaseConfig = { ... } 전체를 붙여 넣어 주세요.');
+  }
+
+  let firebaseModulePromise = null;
+  async function loadFirebaseAiModules() {
+    if (firebaseModulePromise) return firebaseModulePromise;
+    firebaseModulePromise = (async () => {
+      try {
+        const [appModule, aiModule, appCheckModule] = await Promise.all([
+          import(`https://www.gstatic.com/firebasejs/${FIREBASE_SDK_VERSION}/firebase-app.js`),
+          import(`https://www.gstatic.com/firebasejs/${FIREBASE_SDK_VERSION}/firebase-ai.js`),
+          import(`https://www.gstatic.com/firebasejs/${FIREBASE_SDK_VERSION}/firebase-app-check.js`).catch(()=>{throw new Error('Firebase App Check SDK 모듈 로드 실패');}),
+        ]);
+        if (!appModule?.initializeApp || !aiModule?.getAI || !aiModule?.getGenerativeModel || !aiModule?.AgentPlatformBackend) {
+          throw new Error('필수 Firebase AI Agent Platform 모듈을 찾지 못했습니다.');
+        }
+        if(!appCheckModule?.initializeAppCheck||!appCheckModule?.ReCaptchaEnterpriseProvider||!appCheckModule?.getToken)throw new Error('Firebase App Check SDK API 누락');
+        return { ...appModule, ...aiModule, ...appCheckModule };
+      } catch (e) {
+        firebaseModulePromise = null;
+        throw new Error(`Firebase SDK ${FIREBASE_SDK_VERSION} 로드 실패: ${e.message || e}`);
+      }
+    })();
+    return firebaseModulePromise;
+  }
+
+  async function callFirebase(prompt, { test = false } = {}) {
+    const firebaseConfig = parseFirebaseConfigInput(getFirebaseConfig());
+    if (!firebaseConfig) throw new Error('Firebase Config가 비어 있습니다.');
+    const firebase = await loadFirebaseAiModules();
+    const identity = JSON.stringify({ projectId:firebaseConfig.projectId || '', appId:firebaseConfig.appId || '' });
+    const name = `crr-rpcore-${simpleHash(identity)}`;
+    const app = firebase.getApps().some(x => x.name === name) ? firebase.getApp(name) : firebase.initializeApp(firebaseConfig, name);
+    await ensureWishFirebaseAppCheck(firebase,app,firebaseConfig);
+    const ai = firebase.getAI(app, { backend:new firebase.AgentPlatformBackend(FIREBASE_LOCATION) });
+    const gm = firebase.getGenerativeModel(ai, { model:currentModelId(), generationConfig:firebaseGenerationConfig(firebase, test) });
+    try {
+      const result = await gm.generateContent({ contents:[{ role:'user', parts:[{ text:String(prompt || '') }] }] });
+      const response = result?.response;
+      const finishReason = String(response?.candidates?.[0]?.finishReason || '');
+      if (/MAX_TOKENS|LENGTH|BUDGET_EXCEEDED/i.test(finishReason)) throw new Error(`출력이 토큰 한도에서 잘렸습니다. (${finishReason})`);
+      const text = String(await response?.text?.() || '').trim();
+      if (!text) throw new Error(`빈 응답${finishReason ? ` (${finishReason})` : ''}`);
+      return { text, json:result, provider:'firebase' };
+    } catch (e) {
+      const error = new Error(`Firebase AI Logic 호출 실패: ${e.message || e}`);
+      error.fullDetails = `Firebase AI Logic 호출 실패\n${formatErrorDetails(e)}`;
+      throw error;
+    }
+  }
+
+  function reviewOutputTokenBudget(options={},target=activeReviewTarget,config=settings){
+    if(options.test)return 2048;
+    const level=normalizeThinkingLevel(config.responseRefinerThinkingLevel);
+    const reserve=level==='high'?32768:level==='medium'?24576:16384;
+    const textAllowance=Math.ceil(String(target?.content||'').length*1.5)+4096;
+    const requested=Number(options.maxOutputTokens)||0;
+    return Math.min(32768,Math.max(reserve,textAllowance,requested));
+  }
+  function reviewOutputLimitError(response,options={}){
+    const budget=reviewOutputTokenBudget(options);
+    const error=new Error('AI 검토 결과가 출력 한도에 도달해 교정을 완료하지 못했습니다. 원본 RP 응답은 정상적으로 유지했습니다. 다시 검수하면 최대 출력 예산으로 검토합니다. 반복되면 응답교정 추론 수준을 Low로 낮춰 주세요.');
+    error.code='REVIEW_OUTPUT_LIMIT';
+    error.fullDetails=JSON.stringify({code:error.code,finishReason:String(response?.finishReason||''),maxOutputTokens:budget,thinkingLevel:selectedThinkingLevel(),model:currentModelId(),usage:response?.usage||null},null,2);
+    return error;
+  }
+
+  async function callModel(prompt, options = {}) {
+    const showProgress=!options.test&&!!activeReviewTarget;
+    if(showProgress){
+      reviewRequestStartedAt=Date.now();
+      clearInterval(reviewProgressTimer);
+      reviewProgressTimer=setInterval(()=>{
+        if(!badge||badge.style.display==='none'||badge.dataset.result||!workerBusy)return;
+        const seconds=Math.floor((Date.now()-reviewRequestStartedAt)/1000);
+        badge.querySelector('[data-review-detail]').textContent=`${seconds>=45?'검토가 길어지고 있어요':'AI가 선택한 검사 항목을 확인하고 있어요'} · ${seconds}초`;
+        positionReviewBadge();
+      },1000);
+    }
+    try {
+      if(!window.__WISH_RP_MANAGER_AI_BRIDGE__)throw new Error('RP Manager AI 연결을 확인할 수 없습니다.');
+      return await window.__WISH_RP_MANAGER_AI_BRIDGE__.call(prompt, {...options,responseRefiner:true,model:currentModelId(),thinkingLevel:selectedThinkingLevel(!!options.test),responseJsonSchema:options.test?undefined:reviewResponseSchema(),maxOutputTokens:reviewOutputTokenBudget(options),reviewTimeoutMs:180000,onRetry:message=>{setStatus(String(message||'API 재시도 중'));if(showProgress&&badge){const detail=badge.querySelector('[data-review-detail]');if(detail)detail.textContent=String(message||'API 재시도 중');positionReviewBadge();}}});
+    } catch (e) {
+      // 호출 오류가 나더라도 연결 상태를 자동 종료하지 않습니다.
+      throw e;
+    } finally {
+      if(showProgress){clearInterval(reviewProgressTimer);reviewProgressTimer=0;}
+    }
+  }
+
+  function parseJsonLoose(text) {
+    if (!text) return null;
+    const t = String(text).trim();
+    const tries = [
+      t,
+      t.replace(/^```(?:json|javascript|js)?\s*/i, '').replace(/\s*```\s*$/i, '').trim(),
+    ];
+    for (const s of tries) {
+      try { return JSON.parse(s); } catch (_) {}
+    }
+    const start = t.search(/[\[{]/);
+    if (start < 0) return null;
+    for (let end = t.length; end > start; end--) {
+      const tail = t[end - 1];
+      if (tail !== '}' && tail !== ']') continue;
+      try { return JSON.parse(t.slice(start, end)); } catch (_) {}
+    }
+    return null;
+  }
+
+  function correctionUnits(original,parsed) {
+    const replacements=Array.isArray(parsed?.replacements)?parsed.replacements:[];
+    if(!replacements.length)return typeof parsed?.refined_text==='string'?[{from:original,to:parsed.refined_text,start:0,end:original.length,reason:parsed.reason||'전체 응답 수정',evidence:parsed.evidence||'전체 교정본을 직접 확인해 주세요.',verdict:parsed.verdict,category:'legacy',severity:'unconfirmed',autoApplyEligible:false,_issueIndex:0}]:[];
+    const units=replacements.map((r,index)=>{
+      const from=String(r?.from??''),start=original.indexOf(from);
+      if(!from||start<0||original.indexOf(from,start+1)>=0)throw new Error('교정 대상 원문이 없거나 여러 위치에 있어 정확한 변경 범위를 확인할 수 없습니다.');
+      return {...r,from,to:String(r?.to??''),start,end:start+from.length,_issueIndex:Number.isInteger(r?._issueIndex)?r._issueIndex:index};
+    }).sort((a,b)=>a.start-b.start);
+    if(units.some((unit,i)=>i&&unit.start<units[i-1].end))throw new Error('교정 대상 범위가 서로 겹칩니다. 최신 응답을 다시 검수해 주세요.');
+    return units;
+  }
+  function correctionIssueGroups(original,parsed) {
+    const units=correctionUnits(original,parsed),groups=new Map();
+    for(const unit of units){
+      const index=Number.isInteger(unit._issueIndex)?unit._issueIndex:groups.size,key=String(index);
+      if(!groups.has(key)){
+        const meta=Array.isArray(parsed?.issues)?parsed.issues[index]:null;
+        groups.set(key,{index,reason:String(meta?.reason||unit.reason||parsed?.reason||'교정 필요'),evidence:String(meta?.evidence||unit.evidence||parsed?.evidence||''),evidenceSource:String(meta?.evidenceSource||unit.evidenceSource||''),category:String(meta?.category||unit.category||'legacy'),severity:String(meta?.severity||unit.severity||'unconfirmed'),verdict:String(meta?.verdict||unit.verdict||parsed?.verdict||''),autoApplyEligible:meta?.autoApplyEligible===true||unit.autoApplyEligible===true,units:[]});
+      }
+      groups.get(key).units.push(unit);
+    }
+    return [...groups.values()].sort((a,b)=>Math.min(...a.units.map(x=>x.start))-Math.min(...b.units.map(x=>x.start)));
+  }
+  function reindexCorrectionGroups(groups) {
+    const issues=(Array.isArray(groups)?groups:[]).map((group,index)=>{
+      const replacements=(group.units||[]).map(unit=>({...unit,_issueIndex:index}));
+      return {...group,index,replacements,units:replacements};
+    });
+    return {issues,replacements:issues.flatMap(issue=>issue.replacements)};
+  }
+  function applyCorrectionUnits(original,units) {
+    let result=original;
+    for(const unit of [...units].sort((a,b)=>b.start-a.start))result=result.slice(0,unit.start)+unit.to+result.slice(unit.end);
+    return result;
+  }
+  function applyReplacements(original, parsed) {return applyCorrectionUnits(original,correctionUnits(original,parsed));}
+
+  function replacementInnerDiff(from,to) {
+    const a=String(from??''),b=String(to??'');let prefix=0;
+    while(prefix<a.length&&prefix<b.length&&a[prefix]===b[prefix])prefix++;
+    let aEnd=a.length,bEnd=b.length;while(aEnd>prefix&&bEnd>prefix&&a[aEnd-1]===b[bEnd-1]){aEnd--;bEnd--;}
+    return {prefix:b.slice(0,prefix),changedFrom:a.slice(prefix,aEnd),changedTo:b.slice(prefix,bEnd),suffix:b.slice(bEnd)};
+  }
+  function appendPreviewText(root,text,highlighted=false,title='') {
+    if(!text)return;
+    if(!highlighted){root.appendChild(document.createTextNode(text));return;}
+    const span=document.createElement('span');span.className='rr-preview-change';span.textContent=text;if(title)span.title=title;root.appendChild(span);
+  }
+  function previewTextOffset(root,node,localOffset=0) {
+    if(!(root instanceof Node)||!(node instanceof Node)||!root.contains(node))return -1;
+    const walker=document.createTreeWalker(root,NodeFilter.SHOW_TEXT);let total=0;
+    for(let current=walker.nextNode();current;current=walker.nextNode()){if(current===node)return total+Math.max(0,Math.min(Number(localOffset)||0,current.nodeValue?.length||0));total+=current.nodeValue?.length||0;}
+    return -1;
+  }
+  function previewNodeAtOffset(root,offset) {
+    const target=Math.max(0,Number(offset)||0),walker=document.createTreeWalker(root,NodeFilter.SHOW_TEXT);let total=0;
+    for(let current=walker.nextNode();current;current=walker.nextNode()){const len=current.nodeValue?.length||0;if(target<=total+len)return {node:current,offset:Math.max(0,Math.min(len,target-total))};total+=len;}
+    return null;
+  }
+  function capturePreviewScrollAnchor(root) {
+    if(!(root instanceof HTMLElement))return null;
+    const maxScroll=Math.max(0,root.scrollHeight-root.clientHeight),fallbackRatio=maxScroll>0?root.scrollTop/maxScroll:0;
+    if(!root.isConnected||!root.textContent)return {fallbackRatio};
+    const rect=root.getBoundingClientRect(),x=Math.min(rect.right-12,rect.left+22),yCandidates=[rect.top+12,rect.top+28,rect.top+46,rect.top+66];let point=null;
+    for(const y of yCandidates){try{
+      if(document.caretRangeFromPoint){const range=document.caretRangeFromPoint(x,y);if(range?.startContainer&&root.contains(range.startContainer)){point={node:range.startContainer,offset:range.startOffset,y};break;}}
+      else if(document.caretPositionFromPoint){const pos=document.caretPositionFromPoint(x,y);if(pos?.offsetNode&&root.contains(pos.offsetNode)){point={node:pos.offsetNode,offset:pos.offset,y};break;}}
+    }catch(_){}}
+    if(!point)return {fallbackRatio};
+    const full=String(root.textContent||''),charOffset=previewTextOffset(root,point.node,point.offset);if(charOffset<0)return {fallbackRatio};
+    const candidates=[];for(const delta of [0,36,80,140,-36,-80]){const start=Math.max(0,Math.min(full.length,charOffset+delta)),snippet=full.slice(start,Math.min(full.length,start+72));if(snippet.trim().length>=12&&!candidates.some(x=>x.snippet===snippet))candidates.push({snippet,relative:start-charOffset});}
+    return {fallbackRatio,desiredY:point.y-rect.top,charOffset,candidates};
+  }
+  function restorePreviewScrollAnchor(root,anchor) {
+    if(!(root instanceof HTMLElement)||!anchor)return;
+    requestAnimationFrame(()=>{
+      const maxScroll=Math.max(0,root.scrollHeight-root.clientHeight),full=String(root.textContent||'');let matchOffset=-1;
+      for(const candidate of Array.isArray(anchor.candidates)?anchor.candidates:[]){const idx=full.indexOf(candidate.snippet);if(idx>=0&&full.indexOf(candidate.snippet,idx+1)<0){matchOffset=Math.max(0,idx-Number(candidate.relative||0));break;}}
+      if(matchOffset>=0){const pos=previewNodeAtOffset(root,matchOffset);if(pos?.node){try{const range=document.createRange(),len=pos.node.nodeValue?.length||0,start=Math.max(0,Math.min(len,pos.offset));range.setStart(pos.node,start);range.setEnd(pos.node,Math.min(len,start+1));const rr=range.getBoundingClientRect(),rootRect=root.getBoundingClientRect();if(rr&&Number.isFinite(rr.top)){root.scrollTop=Math.max(0,Math.min(maxScroll,root.scrollTop+(rr.top-rootRect.top)-Number(anchor.desiredY||12)));return;}}catch(_){}}}
+      root.scrollTop=Math.max(0,Math.min(maxScroll,maxScroll*Math.max(0,Math.min(1,Number(anchor.fallbackRatio)||0))));
+    });
+  }
+  function renderCorrectionPreview(root,original,units) {
+    root.replaceChildren();const ranges=[...(Array.isArray(units)?units:[])].sort((a,b)=>a.start-b.start);
+    if(!ranges.length){root.textContent=String(original??'');return;}
+    let cursor=0;
+    for(const r of ranges){
+      if(r.start<cursor||String(original).slice(r.start,r.end)!==String(r.from)){root.textContent=String(original??'');return;}
+      appendPreviewText(root,String(original).slice(cursor,r.start));const diff=replacementInnerDiff(r.from,r.to);appendPreviewText(root,diff.prefix);
+      if(diff.changedTo)appendPreviewText(root,diff.changedTo,true,diff.changedFrom?`변경 전: ${diff.changedFrom}`:'새로 추가되는 내용');
+      else if(diff.changedFrom)appendPreviewText(root,'〔삭제〕',true,`삭제되는 내용: ${diff.changedFrom}`);
+      appendPreviewText(root,diff.suffix);cursor=r.end;
+    }
+    appendPreviewText(root,String(original).slice(cursor));
+  }
+
+  function looksLikeUserCopy(candidate, recentMessages) {
+    const c = normalizeText(candidate);
+    if (c.length < 8) return false;
+    return recentMessages.some(m => {
+      if (m.role !== 'user') return false;
+      const u = normalizeText(m.content);
+      if (!u) return false;
+      if (c === u) return true;
+      const ratio = Math.min(c.length, u.length) / Math.max(c.length, u.length);
+      return ratio >= 0.92 && (c.includes(u) || u.includes(c));
+    });
+  }
+
+  async function patchMessage(target, newText) {
+    const chatId = getChatId();
+    if (!chatId || !target?.id) throw new Error('수정 대상 메시지 ID를 찾지 못함');
+    const bridge = window.__WISH_RP_MANAGER_AI_BRIDGE__;
+    if (!bridge?.writeReviewedResponse) throw new Error('RP Manager 연결을 확인한 뒤 다시 검수해 주세요.');
+    setStatus('반영 확인 중');
+    return bridge.writeReviewedResponse(chatId, target.id, target.content, newText);
+  }
+
+  function escapeHTML(value) {
+    return String(value ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function stripMarkdown(text) {
+    return String(text || '')
+      .replace(/`{3}\w*\n?/g, '')
+      .replace(/`([^`]+)`/g, '$1')
+      .replace(/\*\*([^*]+)\*\*/g, '$1')
+      .replace(/\*([^*]+)\*/g, '$1')
+      .replace(/~~(.+?)~~/g, '$1')
+      .replace(/^#+\s+/gm, '')
+      .replace(/^[-*+]\s+/gm, '')
+      .replace(/^\d+\.\s+/gm, '')
+      .replace(/^>\s+/gm, '')
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+      .replace(/!\[([^\]]*)\]\([^)]+\)/g, '$1')
+      .replace(/\n{2,}/g, '\n')
+      .trim();
+  }
+
+  function normalizeCrackLinebreaks(value) {
+    return String(value ?? '')
+      .replace(/\r\n?/g, '\n')
+      .replace(/\u0000/g, '');
+  }
+
+  const RENDER_BOUNDARY = '\uE000';
+
+  function logicalBreakBetweenTextNodes(a, b, root) {
+    if (!(a instanceof Text) || !(b instanceof Text)) return true;
+    const BLOCK_TAGS = new Set(['P','DIV','LI','BLOCKQUOTE','PRE','H1','H2','H3','H4','H5','H6','TABLE','TR','TD','TH','SECTION','ARTICLE']);
+
+    const nearestBlock = node => {
+      let cur = node?.parentElement || null;
+      while (cur && cur !== root) {
+        if (BLOCK_TAGS.has(cur.tagName)) return cur;
+        cur = cur.parentElement;
+      }
+      return root;
+    };
+
+    if (nearestBlock(a) !== nearestBlock(b)) return true;
+
+    try {
+      const range = document.createRange();
+      range.setStartAfter(a);
+      range.setEndBefore(b);
+      const frag = range.cloneContents();
+      if (frag.querySelector?.('br,p,div,li,blockquote,pre,h1,h2,h3,h4,h5,h6,table,tr,td,th,section,article')) return true;
+    } catch (_) {}
+
+    return false;
+  }
+
+  function buildRenderedTextIndex(root) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const segments = [];
+    let flat = '';
+    let prev = null;
+
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      const raw = String(node.nodeValue || '');
+      if (prev && logicalBreakBetweenTextNodes(prev, node, root)) flat += RENDER_BOUNDARY;
+      const start = flat.length;
+      flat += raw;
+      segments.push({ node, start, end:flat.length });
+      prev = node;
+    }
+    return { flat, segments };
+  }
+
+  function findUniqueRenderedRange(root, source) {
+    const needle = normalizeCrackLinebreaks(source);
+    if (!needle || needle.includes('\n') || needle.includes(RENDER_BOUNDARY)) return null;
+
+    const index = buildRenderedTextIndex(root);
+    const at = index.flat.indexOf(needle);
+    if (at < 0) return null;
+    if (index.flat.indexOf(needle, at + 1) >= 0) return null;
+
+    const end = at + needle.length;
+    const overlaps = index.segments.filter(seg => seg.end > at && seg.start < end);
+    if (!overlaps.length) return null;
+
+    // 논리적 문단/줄바꿈 경계를 가로질러서는 절대 즉시 패치하지 않습니다.
+    if (index.flat.slice(at, end).includes(RENDER_BOUNDARY)) return null;
+
+    return { index, at, end, overlaps };
+  }
+
+  function replacePlainTextAcrossNodes(root, from, to) {
+    const source = normalizeCrackLinebreaks(from);
+    const replacement = normalizeCrackLinebreaks(to);
+    if (!source || source.includes('\n') || replacement.includes('\n')) return false;
+
+    const match = findUniqueRenderedRange(root, source);
+    if (!match) return false;
+
+    const { at, end, overlaps } = match;
+    let remaining = replacement;
+
+    overlaps.forEach((seg, i) => {
+      const node = seg.node;
+      const raw = String(node.nodeValue || '');
+      const localStart = Math.max(0, at - seg.start);
+      const localEnd = Math.min(raw.length, end - seg.start);
+      const matchedLen = Math.max(0, localEnd - localStart);
+
+      let piece = '';
+      if (i === overlaps.length - 1) {
+        piece = remaining;
+        remaining = '';
+      } else {
+        const take = Math.min(matchedLen, remaining.length);
+        piece = remaining.slice(0, take);
+        remaining = remaining.slice(take);
+      }
+
+      node.nodeValue = raw.slice(0, localStart) + piece + raw.slice(localEnd);
+    });
+
+    return remaining.length === 0;
+  }
+
+  function domStructureSignature(root) {
+    const out = [];
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      if (node.nodeType === Node.TEXT_NODE) out.push('#text');
+      else out.push(`<${node.nodeName}>`);
+    }
+    return out.join('|');
+  }
+
+  function simulateSafeRenderedReplacements(root, replacements) {
+    if (!(root instanceof Element)) return false;
+    const clone = root.cloneNode(true);
+    const beforeSig = domStructureSignature(clone);
+
+    for (const rep of replacements) {
+      const fromPlain = stripMarkdown(String(rep?.from ?? ''));
+      const toPlain = stripMarkdown(String(rep?.to ?? ''));
+      if (!fromPlain || fromPlain.includes('\n') || toPlain.includes('\n')) return false;
+      if (!replacePlainTextAcrossNodes(clone, fromPlain, toPlain)) return false;
+    }
+
+    return domStructureSignature(clone) === beforeSig;
+  }
+
+  function singlePlainDiff(oldText, newText) {
+    const a = normalizeCrackLinebreaks(oldText);
+    const b = normalizeCrackLinebreaks(newText);
+    let start = 0;
+    while (start < a.length && start < b.length && a[start] === b[start]) start++;
+    let aEnd = a.length;
+    let bEnd = b.length;
+    while (aEnd > start && bEnd > start && a[aEnd - 1] === b[bEnd - 1]) {
+      aEnd--;
+      bEnd--;
+    }
+    return { from:a.slice(start, aEnd), to:b.slice(start, bEnd) };
+  }
+
+  function findVisibleMessageMarkdown(target) {
+    const id = String(target?.id || '');
+    if (id) {
+      try {
+        const escaped = CSS.escape(id);
+        const host = document.querySelector(
+          `[data-message-id="${escaped}"],[data-message-group-id="${escaped}"]`
+        );
+        const exact = host?.matches?.('.wrtn-markdown') ? host : host?.querySelector?.('.wrtn-markdown');
+        if (exact) return exact;
+      } catch (_) {}
+    }
+
+    const oldPlain = stripMarkdown(target?.content || '');
+    const snippet = normalizeText(oldPlain.length > 48 ? oldPlain.slice(-48) : oldPlain);
+    if (!snippet) return null;
+    for (const node of document.querySelectorAll('.wrtn-markdown')) {
+      if (normalizeText(node.textContent).includes(snippet)) return node;
+    }
+    return null;
+  }
+
+  /*
+   * 서버 원문은 PATCH로 수정하되, 화면의 .wrtn-markdown 전체를 innerHTML로 다시 만들지 않습니다.
+   * Crack의 기존 DOM 구조(문단/줄바꿈/서식)는 그대로 두고 안전하게 찾을 수 있는 텍스트 조각만
+   * Text node 수준에서 바꿉니다. 이렇게 하면 <p> 경계가 개행으로 재직렬화되어
+   * 한 줄씩 빈 줄이 끼는 현상을 피할 수 있습니다.
+   *
+   * 첨부된 "수정창 줄바꿈 보존" 확프와 같은 원칙으로, 줄바꿈은 paragraph 재생성이 아니라
+   * 필요한 경우에만 <br>로 표현합니다. 안전한 위치를 찾지 못하면 DOM을 억지로 재구성하지 않고
+   * 서버 반영만 유지하여 Crack의 네이티브 렌더가 형식을 결정하도록 둡니다.
+   */
+  function patchVisibleMessage(target, newText, parsed = null) {
+    const node = findVisibleMessageMarkdown(target);
+    if (!node) return false;
+
+    const reps = Array.isArray(parsed?.replacements) ? parsed.replacements : [];
+    if (reps.length) {
+      // 실제 DOM을 만지기 전에 복제본에서 전체 교체를 먼저 시뮬레이션합니다.
+      // 모든 교체가 유일하게 식별되고 DOM 구조가 그대로일 때만 실화면에 적용합니다.
+      if(reps.some(rep=>String(rep.from)!==String(rep.to)&&stripMarkdown(rep.from)===stripMarkdown(rep.to)))return false;
+      if (!simulateSafeRenderedReplacements(node, reps)) return false;
+
+      // 실화면 적용 중 예상치 못한 DOM 변화가 끼어들어도 부분 적용 상태를 남기지 않습니다.
+      // Text node 값만 스냅샷하고 실패 시 그대로 되돌리므로 DOM 구조/이벤트는 건드리지 않습니다.
+      const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+      const snapshot = [];
+      for (let t = walker.nextNode(); t; t = walker.nextNode()) snapshot.push([t, String(t.nodeValue || '')]);
+
+      for (const rep of reps) {
+        const fromPlain = stripMarkdown(String(rep?.from ?? ''));
+        const toPlain = stripMarkdown(String(rep?.to ?? ''));
+        if (!replacePlainTextAcrossNodes(node, fromPlain, toPlain)) {
+          for (const [t, value] of snapshot) {
+            try { if (t?.isConnected) t.nodeValue = value; } catch (_) {}
+          }
+          return false;
+        }
+      }
+      return true;
+    }
+
+    // 사용자가 확인창에서 교정본을 직접 수정했거나 replacements가 없는 경우에도
+    // 단일 차이가 한 문단 안에서 유일하게 식별되는 경우만 복제본 검증 후 즉시 반영합니다.
+    const oldPlain = stripMarkdown(target?.content || '');
+    const newPlain = stripMarkdown(newText);
+    const diff = singlePlainDiff(oldPlain, newPlain);
+    if (!diff.from || diff.from.includes('\n') || diff.to.includes('\n')) return false;
+
+    const synthetic = [{ from:diff.from, to:diff.to }];
+    if (!simulateSafeRenderedReplacements(node, synthetic)) return false;
+
+    const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+    const snapshot = [];
+    for (let t = walker.nextNode(); t; t = walker.nextNode()) snapshot.push([t, String(t.nodeValue || '')]);
+    if (replacePlainTextAcrossNodes(node, diff.from, diff.to)) return true;
+    for (const [t, value] of snapshot) {
+      try { if (t?.isConnected) t.nodeValue = value; } catch (_) {}
+    }
+    return false;
+  }
+
+  async function applyCorrection(target, correctedText, reason, parsed = null, options = {}) {
+    const reviewScope=chatStateKey();
+    const guardNativeEdit=async()=>{
+      if(findOpenCrackEditDialog()){
+        setStatus('수정창 닫힘 대기');
+        await waitForCrackEditDialogToClose();
+      }
+      if(chatStateKey()!==reviewScope){const error=new Error('방이 바뀌었습니다. 현재 응답을 다시 검수해 주세요.');error.code='STALE_RESPONSE_REVIEW';throw error;}
+      await assertReviewSource(target,getChatId());
+    };
+    await guardNativeEdit();
+    setStatus('서버 반영 중');
+    const recent=await fetchRecentMessages(20);
+    if(looksLikeUserCopy(correctedText,recent))throw new Error('사용자 입력과 같은 교정본은 적용할 수 없습니다.');
+    const safeText = normalizeCrackLinebreaks(correctedText);
+    saveCorrectionArchive(target,safeText,reason,'적용 대기');
+    let result;
+    try{await guardNativeEdit();result=await patchMessage(target,safeText);}catch(error){saveCorrectionArchive(target,safeText,reason+' · '+String(error.message||error),'적용 확인 실패');throw error;}
+    baselineFingerprint = messageFingerprint(result);
+    markProcessed({ id: result.id, content: result.content });
+    if (result.pendingSaveError) { window.__WISH_RP_MANAGER_AI_BRIDGE__?.reportRefinerIssue('error','응답 교정은 저장됐지만 주입 복구 정보의 로컬 저장을 확인해 주세요: '+result.pendingSaveError,target.id); toast('교정 저장 완료 · 로컬 주입 정보 확인 필요','error'); }
+    const domNode=findVisibleMessageMarkdown(target);
+    let domOk=patchVisibleMessage(target,result.content,parsed);
+    if(domOk&&domNode){const expected=domNode.textContent;await sleep(180);domOk=domNode.isConnected&&domNode.textContent===expected;}
+    saveCorrectionArchive(target,safeText,reason,domOk?'서버 저장·화면 반영 확인':'서버 저장 확인 · 화면 새로고침 필요');
+    try{await window.__WISH_RP_MANAGER_AI_BRIDGE__?.sourceMutated(target.id,messageFingerprint(target),messageFingerprint({id:result.id,content:result.content}),getRoomScopeKey(getChatId()));}catch(error){window.__WISH_RP_MANAGER_AI_BRIDGE__?.reportRefinerIssue('error','교정은 서버에 저장됐지만 관련 초안 상태 저장에 실패했습니다. 원문을 다시 검증해 주세요.',target.id);toast('교정 저장 완료 · 관련 초안 상태 확인 필요','error');}
+    addProcessHistory('교정 적용',reason,{target,corrected:{id:result.id,content:result.content},verdict:parsed?.verdict||''});
+    setStatus(options.reloadAfter === false ? (domOk?'교정 완료':'서버 저장 완료 · 화면 갱신 필요') : '교정 완료 · 새로고침 준비', 'ok');
+    if (options.reloadAfter === false) showReviewNotice(domOk?'교정 완료':'교정 저장 완료 · 화면 갱신 필요', domOk ? String(reason||'응답의 오류를 수정했습니다.') : '서버 저장은 확인됐지만 화면 갱신은 확인하지 못했습니다. 남은 교정 확인이 끝나면 자동으로 새로고침합니다.', 'ok', domOk ? 3400 : 5000);
+    else scheduleRefinerReload(domOk ? 650 : 350);
+    return {...target,id:result.id,content:result.content};
+  }
+
+  function refinerGenerationVisible() {
+    // Crack UI의 중지 버튼/aria-label은 렌더 상태에 따라 응답 완료 뒤에도 잠깐 남을 수 있습니다.
+    // 따라서 이 값은 '힌트'로만 사용하고 서버 응답의 안정성을 영구 차단하는 근거로 쓰지 않습니다.
+    const candidates=document.querySelectorAll('[data-state="streaming"],[data-status="generating"],[aria-label="생성 중"],[aria-label="응답 생성 중"],button[aria-label*="생성 중지"],button[aria-label*="응답 중지"]');
+    return [...candidates].some(node=>{
+      if(node.closest('[id^="rpcm-"],.rr-settings-sheet,.rr-confirm-box'))return false;
+      const style=getComputedStyle(node);
+      return style.display!=='none'&&style.visibility!=='hidden'&&node.getClientRects().length>0;
+    });
+  }
+  async function waitStableAssistant() {
+    let previous=null,stableSamples=0;
+    const roomId=getChatId();
+    // 서버 본문이 연속해서 동일한지를 최우선으로 봅니다. DOM의 '생성 중' 표시는 보조 신호일 뿐입니다.
+    for(let i=0;i<12;i++){
+      if(getChatId()!==roomId)return null;
+      const current=await findLastAssistant();
+      const status=String(current?.raw?.status||current?.raw?.state||'');
+      const explicitPending=/^(streaming|generating|pending|in_progress|inprogress)$/i.test(status);
+      if(!current||explicitPending){previous=null;stableSamples=0;}
+      else {
+        stableSamples=previous&&messageFingerprint(previous)===messageFingerprint(current)?stableSamples+1:0;
+        previous=current;
+        // Explicit server completion overrides a lingering stop control. An unknown-status
+        // response with a visible generator is not complete merely because text paused.
+        const domGenerating=refinerGenerationVisible();
+        const explicitlyComplete=/^(completed|complete|done|success)$/i.test(status);
+        const requiredSamples=domGenerating&&!explicitlyComplete?Infinity:3;
+        if(stableSamples>=requiredSamples){
+          const final=await findLastAssistant();
+          if(getChatId()!==roomId||!final||messageFingerprint(final)!==messageFingerprint(current))return null;
+          const finalStatus=String(final.raw?.status||final.raw?.state||'');
+          if(/^(streaming|generating|pending|in_progress|inprogress)$/i.test(finalStatus))return null;
+          if(refinerGenerationVisible()&&!/^(completed|complete|done|success)$/i.test(finalStatus))return null;
+          return final;
+        }
+      }
+      if(i<11)await sleep(1000);
+    }
+    return null;
+  }
+
+  async function runRefiner({ force = false, targetOverride = null, maxOutputTokens = 0, reviewMode = '' } = {}) {
+    if (workerBusy) {
+      if (force) toast('이미 교정 작업이 진행 중이야.');
+      return;
+    }
+    if (!force && !settings.enabled) return;
+    if(!enabledReviewTopics().length){setStatus('검사 항목 OFF');showReviewNotice('응답을 유지했어요','검사 항목이 모두 꺼져 있습니다. 검사할 항목을 선택해 주세요.','info',5000);return;}
+    if (!connectionOk) {
+      if(!force){const target=targetOverride||await findLastAssistant();if(target){setReviewGate(target,'error');showReviewFailure(target,new Error('공용 AI 연결 확인이 필요합니다.'));}}
+      if (force) openSettings();
+      setStatus('AI 연결 확인 필요','error');showReviewNotice('아직 검토하지 못했어요','AI 연결이 종료되어 있습니다. 설정에서 현재 연결 방식 테스트를 눌러 주세요.','error');
+      return;
+    }
+    if (!providerReady()) {
+      const target=targetOverride||await findLastAssistant();
+      if(target){setReviewGate(target,'error');showReviewFailure(target,new Error('기존 공용 AI 연결 설정을 확인해 주세요.'));}
+      setStatus('AI 설정 확인 필요','error');showReviewNotice('아직 검토하지 못했어요','RP Manager의 공용 AI 연결 설정을 확인해 주세요.','error');
+      return;
+    }
+    const chatId = getChatId();
+    if (!chatId) { if (force) toast('채팅방 ID 감지 실패', 'error'); return; }
+
+    const reviewEpoch=autoPrimeEpoch;
+    workerBusy = true;activeReviewMode=reviewMode||settings.reviewMode;
+    reviewTiming={startedAt:Date.now(),thinkingLevel:selectedThinkingLevel(),model:currentModelId(),mode:activeReviewMode};
+    try {
+      setStatus('응답 완료 기다리는 중');
+      const target = targetOverride ? normalizeMessage(targetOverride) : await waitStableAssistant();
+      reviewTiming.stableMs=Date.now()-reviewTiming.startedAt;
+      if (!target) {setStatus('응답 완료 확인 대기');showReviewNotice('아직 검토하지 못했어요','응답 완료를 아직 확인하지 못했습니다. 잠시 후 다시 검수해 주세요.','info',5000);return;}
+      if(isPendingResponse(target))throw new Error('선택한 응답이 아직 생성 중입니다. 완료된 뒤 다시 검수해 주세요.');
+      if(targetOverride)await assertReviewSource(target,chatId);
+      if (target.contextMalformed) throw new Error('숨김 주입 블록이 완전하지 않습니다. 주입 재검증 후 다시 검수해 주세요.');
+      if (!target.content.trim()) throw new Error('검수할 응답 본문이 없습니다.');
+      if (!force && isProcessed(target)) {setStatus('이미 검토한 응답');showReviewNotice('이미 검토한 응답이에요','본문이 바뀌지 않아 API를 다시 호출하지 않았습니다. 최근 검토 결과와 처리기록에서 이전 결과를 확인할 수 있어요.','info');return;}
+
+      if(!enabledReviewTopics().length){markProcessed(target);setStatus('검사 항목 OFF');showReviewNotice('응답을 유지했어요','검사 항목이 모두 꺼져 있습니다. 검사할 항목을 선택해 주세요.','info',5000);return;}
+      target.reviewScope=chatStateKey();activeReviewTarget=target;activeReviewStartedAt=Date.now();setReviewGate(target,'review-running');
+      if(!force){
+        const autoKey=messageAutoKey(target);
+        if(autoFailureKey&&autoFailureKey!==autoKey){autoFailureKey='';autoFailureCount=0;}
+        lastAutoAssistantKey=autoKey;
+      }
+      setStatus('관련 기억 찾는 중');
+      const referenceStarted=Date.now();
+      const latest=targetOverride?await findLastAssistant():target;
+      const historical=!!latest&&String(latest.id)!==String(target.id);
+      const recent = await fetchRecentMessages(historical?50:truncationOnly()?Math.min(8,Math.max(4,2*Math.min(2,settings.contextTurns)+2)):Math.max(12,2*settings.contextTurns+8));
+      let snapshot;
+      try {
+        snapshot = historical?{room:null,activePacks:[],available:false,reason:'과거 응답 검수 · 대상 이전 대화만 사용; 이후의 저장 상태를 소급 적용하지 않음'}:truncationOnly()?{room:null,activePacks:[],available:false,reason:'문장 끊김 전용 검사 · 기억 조회 생략'}:await readWishCoreSnapshot(target.content,recent,{includeLongTerm:!structuralOnly()});
+      } catch (coreError) {
+        console.warn('[Wish Response Refiner] RP Manager optional read failed; falling back to Recent Context only.', coreError);
+        snapshot = {
+          room:null, activePacks:[],
+          apiChatId:chatId, roomKey:getRoomScopeKey(chatId), available:false,
+          reason:`RP Manager 읽기 실패: ${coreError?.message || coreError}`
+        };
+      }
+      const core = buildWishCoreReference(snapshot, target.content, recent);
+      const contextText = buildContextText(recent, target);
+      const formatAnalysis=outputFormatAnalysis(recent,target);
+
+      setStatus('검수 중');
+      const template = settings.template === 'custom' ? String(settings.customPrompt || '').trim() : currentBasicPrompt();
+      if (!template) throw new Error('커스텀지침이 비어 있습니다.');
+      const prompt = fillPrompt(template, {
+        ...core,
+        context: contextText,
+        message: target.content,
+        structuralHints:structuralHintsText(target.content),
+        formatReference:buildOutputFormatReference(recent,target),
+      });
+      reviewTiming.referenceMs=Date.now()-referenceStarted;
+      setStatus('응답 받아오는 중');
+      const policy=(settings.exceptions||[]).filter(row=>row.enabled!==false).map(row=>row.text).join('\n');
+      const reviewPrompt=prompt+(policy?'\n[USER_APPROVED_REVIEW_POLICY]\n'+policy+'\n[/USER_APPROVED_REVIEW_POLICY]':'');
+      reviewTiming.promptChars=reviewPrompt.length;
+      const requestStarted=Date.now();let response;
+      try{response=await callModel(reviewPrompt,{maxOutputTokens});}finally{reviewTiming.requestMs=Date.now()-requestStarted;}
+      if(response?.model)reviewTiming.model=response.model;
+      if(response?.fallbackFromModel){reviewTiming.fallbackFromModel=response.fallbackFromModel;reviewTiming.fallbackModel=response.model||response.fallbackModel||'gemini-3.8-flash';}
+      reviewTiming.inputTokens=response.usage?.inputTokens||0;reviewTiming.outputTokens=response.usage?.outputTokens||0;
+      if(/MAX_TOKENS|LENGTH|BUDGET_EXCEEDED|TOKEN_LIMIT|INCOMPLETE/i.test(String(response.finishReason||'')))throw reviewOutputLimitError(response,{maxOutputTokens});
+      // 최신 응답을 검수하는 동안 Crack 네이티브 수정창에서 사용자가 직접 편집했으면
+      // 수정 전 원문 기준 제안은 폐기합니다. 과거 응답 수동 검수는 기존 source fingerprint 검증만 사용합니다.
+      if(!historical){
+        const latestGuard=await reconcileLatestTargetBeforeCorrection(target,force);
+        if(latestGuard.discard){
+          if(latestGuard.reason==='user-edited'&&latestGuard.target){
+            markProcessed(latestGuard.target);baselineFingerprint=messageFingerprint(latestGuard.target);
+            addProcessHistory('사용자 수정 · 교정 폐기','검수 중 사용자가 같은 응답을 직접 수정해 수정 전 원문 기준 교정안을 폐기했습니다.',{target:latestGuard.target});
+            setStatus('사용자 수정 · 기존 교정 생략');showReviewNotice('사용자 수정본을 유지했어요','수정 전 원문을 기준으로 만든 교정 제안은 적용하지 않았습니다. 필요하면 최근 AI 응답 재검수를 누르세요.','info',5500);
+          }else{setStatus('검수 대상 변경 · 원본 유지');}
+          return;
+        }
+        if(latestGuard.rerun&&latestGuard.target){
+          setReviewGate(target,'stale');setStatus('최신 응답 재검수');
+          if(force)setTimeout(()=>runRefiner({force:true,targetOverride:latestGuard.target}),80);
+          else{lastAutoAssistantKey='';autoCheckQueued=true;setTimeout(()=>scheduleAutoCheck(400),80);}
+          return;
+        }
+      }
+      await assertReviewSource(target,chatId);
+      if(!force&&(!settings.enabled||reviewEpoch!==autoPrimeEpoch)){setReviewGate(target,'settled');setStatus('자동 검수 중지 · 원본 유지');showReviewNotice('검수 중단 · 원본 유지',settings.enabled?'검수 도중 방 또는 설정 기준이 바뀌어 결과를 적용하지 않았습니다.':'자동 검수를 꺼서 결과를 적용하지 않았습니다. 다시 검수할 수 있어요.','info');return;}
+      setStatus('교정 결과 확인 중');
+      const text = String(response.text || '').trim();
+
+      reviewTiming.completedAt=Date.now();reviewTiming.validationMs=reviewTiming.completedAt-reviewTiming.startedAt-reviewTiming.stableMs-reviewTiming.referenceMs-reviewTiming.requestMs;
+      let parsed=/^PASS\s*$/i.test(text)?{verdict:'PASS',reason:'',replacements:[]}:normalizeReviewResult(parseJsonLoose(text));
+      if (!parsed) throw new Error(`응답 해석 실패: ${text.slice(0, 120)}`);
+      if(parsed.verdict==='PASS'&&formatAnalysis.missing.length){
+        parsed={verdict:'AMBIGUOUS',replacements:[],reason:`최근 ${formatAnalysis.history.length}개 AI 응답에서 반복된 ${formatAnalysis.missing.join(' / ')} 블록이 이번 응답에 없거나 코드블록 형식이 깨졌습니다. AI가 복구 내용을 확정하지 못해 원본을 유지했습니다.`,evidence:'최근 완료 AI 응답의 필수 블록 구조와 비교한 누락 후보'};
+      }
+      const verdict=String(parsed.verdict||'').toUpperCase();
+      if(verdict==='MEMORY_STALE'||verdict==='AMBIGUOUS'){
+        markProcessed(target);baselineFingerprint=messageFingerprint(target);
+        const reason=String(parsed.reason||parsed.evidence||'최신 RP와 저장 기억의 관계를 확인해 주세요.');
+        addProcessHistory(verdict==='MEMORY_STALE'?'기억 검토 필요':'근거 불충분',reason,{target,verdict});
+        setStatus(verdict==='MEMORY_STALE'?'기억 검토 필요':'판단 보류');
+        if(verdict==='MEMORY_STALE')window.__WISH_RP_MANAGER_AI_BRIDGE__?.reportMemoryStale(reason,target.id);else window.__WISH_RP_MANAGER_AI_BRIDGE__?.reportRefinerIssue('ambiguous',reason,target.id);
+        showReviewNotice(verdict==='MEMORY_STALE'?'응답 유지 · 기억 확인 필요':'응답 유지 · 근거 불충분',reason,'info',5500);
+        return;
+      }
+      if (verdict==='PASS') {
+        markProcessed(target);
+        baselineFingerprint = messageFingerprint(target);
+        addProcessHistory('PASS');
+        setStatus('이상 없음', 'ok');
+        showReviewNotice('검토 완료 · 이상 없음','선택한 검사 항목에서 교정할 내용을 찾지 못했습니다.');
+        return;
+      }
+      if(verdict==='CONTINUITY_DRIFT'&&!parsed.replacements.length&&!parsed.refined_text){addProcessHistory(verdict,parsed.reason||'연속성 판단을 확인해 주세요.',{target,verdict});await showCorrectionConfirm({target,corrected:target.content,reason:parsed.reason||'연속성 판단을 확인해 주세요.',parsed});return;}
+      if (!parsed.replacements && !parsed.refined_text) throw new Error('Gemini 응답 구조가 교정 형식이 아님');
+
+      const corrected = applyCorrectionUnits(target.content,validateReviewUnits(target.content,parsed));
+      if (normalizeCrackLinebreaks(corrected) === normalizeCrackLinebreaks(target.content)) {
+        markProcessed(target);
+        baselineFingerprint = messageFingerprint(target);
+        addProcessHistory('PASS');
+        setStatus('변경 없음', 'ok');
+        showReviewNotice('검토 완료 · 변경 없음','교정 제안이 원본과 같아 응답을 그대로 유지했습니다.');
+        return;
+      }
+      if (looksLikeUserCopy(corrected, recent)) {
+        markProcessed(target);
+        baselineFingerprint = messageFingerprint(target);
+        addProcessHistory('교정미적용');
+        setStatus('유저 입력 복사 감지', 'error');
+        showReviewNotice('응답을 유지했어요','교정본이 사용자 입력과 거의 같아 잘못 적용되지 않도록 원본을 유지했습니다.','info',5500);
+        return;
+      }
+
+      const reason = String(parsed.reason || '교정 필요');
+      addProcessHistory(verdict,reason,{target,verdict});
+      setStatus(verdict==='CONTINUITY_DRIFT'?'연속성 이탈 · 확인 필요':'응답 오류 · 처리 중');
+      if(settings.autoApply){
+        // 논리적 issue 하나에 묶인 여러 replacement는 자동반영에서도 원자적으로 처리합니다.
+        const issueGroups=correctionIssueGroups(target.content,parsed);
+        const objectiveGroups=issueGroups.filter(group=>group.verdict==='RESPONSE_ERROR'&&reviewAutoApplyEligible(target.content,{...parsed,verdict:'RESPONSE_ERROR',replacements:group.units}));
+        const objectivePack=reindexCorrectionGroups(objectiveGroups),objective=objectivePack.replacements;
+        if(objective.length){
+          const objectiveResult={...parsed,verdict:'RESPONSE_ERROR',replacements:objectivePack.replacements,issues:objectivePack.issues};
+          const objectiveSet=new Set(objectiveGroups.flatMap(group=>group.units)),remainingGroups=issueGroups.filter(group=>group.units.some(unit=>!objectiveSet.has(unit))),remainingPack=reindexCorrectionGroups(remainingGroups),remaining=remainingPack.replacements;
+          const appliedTarget=await applyCorrection(target,applyCorrectionUnits(target.content,validateReviewUnits(target.content,objectiveResult)),reason,objectiveResult,{reloadAfter:!remaining.length});
+          if(remaining.length){
+            const remainingResult={...parsed,replacements:remainingPack.replacements,issues:remainingPack.issues,verdict:remaining.some(unit=>unit.verdict==='CONTINUITY_DRIFT')?'CONTINUITY_DRIFT':'RESPONSE_ERROR'};
+            activeReviewTarget=appliedTarget;
+            const proposed=applyCorrectionUnits(appliedTarget.content,validateReviewUnits(appliedTarget.content,remainingResult));
+            await showCorrectionConfirm({target:appliedTarget,corrected:proposed,reason:reason+' · 확정된 오류는 반영했고 나머지 제안은 확인을 기다립니다.',parsed:remainingResult});
+          }
+        }else await showCorrectionConfirm({target,corrected,reason,parsed});
+      }else await showCorrectionConfirm({target,corrected,reason,parsed});
+    } catch (e) {
+      addProcessHistory('오류', formatErrorHistory(e));
+      setStatus('오류', 'error');
+      console.error('[Crack Response Refiner RP Manager]', e);
+      if(!force&&activeReviewTarget){
+        const failedKey=messageAutoKey(activeReviewTarget);
+        if(autoFailureKey===failedKey)autoFailureCount+=1;else{autoFailureKey=failedKey;autoFailureCount=1;}
+        const retryable=!['CRACK_AUTH_REQUIRED','STALE_RESPONSE_REVIEW','RESPONSE_READBACK_UNVERIFIED','REVIEW_OUTPUT_LIMIT','AI_TRANSIENT_EXHAUSTED'].includes(String(e.code||''));
+        if(retryable&&autoFailureCount<=2){
+          if(lastAutoAssistantKey===failedKey)lastAutoAssistantKey='';
+          autoCheckQueued=true;
+        }
+      }
+      if(activeReviewTarget){setReviewGate(activeReviewTarget,e.code==='STALE_RESPONSE_REVIEW'?'stale':'error');showReviewFailure(activeReviewTarget,e);}
+      window.__WISH_RP_MANAGER_AI_BRIDGE__?.reportRefinerIssue(e.code==='STALE_RESPONSE_REVIEW'?'stale':'error',e.message,activeReviewTarget?.id);
+      if(e.code!=='RESPONSE_READBACK_UNVERIFIED')showReviewNotice('응답 검토를 마치지 못했어요',String(e.message||e),'error',6000);
+    } finally {
+      clearInterval(reviewProgressTimer);reviewProgressTimer=0;
+      workerBusy = false;activeReviewTarget=null;activeReviewMode='';
+      if (badge && !badge.dataset.result && !confirmOverlay) hideReviewNotice();
+    }
+  }
+
+  function showReviewFailure(target,error) {
+    if(error?.code==='RESPONSE_READBACK_UNVERIFIED'){
+      showReviewNotice('응답 반영 확인 필요','응답이 반영되지 않았다면 새로고침해 주세요.','error',7000);
+      showRefinerRefreshPrompt(String(error.message||error));
+      return;
+    }
+    showReviewNotice('응답 검토를 마치지 못했어요',String(error.message||error),'error',6000);
+    if(confirmOverlay)return;
+    ensureThemeStyles();
+    const overlay=document.createElement('div');confirmOverlay=overlay;
+    overlay.id='wish-rpcore-refiner-confirm';overlay.className='wish-rpcore-refiner-ui';
+    overlay.style.cssText='position:fixed;inset:0;z-index:2147483646;background:var(--rr-scrim);display:grid;place-items:center;padding:16px';
+    const box=document.createElement('section');box.className='rr-confirm-box rr-failure-box';box.setAttribute('role','dialog');box.setAttribute('aria-modal','true');box.setAttribute('aria-labelledby','rr-failure-title');
+    box.innerHTML='<header class="rr-confirm-head"><div class="rr-confirm-heading"><small>WISH · RESPONSE REVIEW</small><h3 id="rr-failure-title">응답 검토를 마치지 못했어요</h3><p>원본 응답은 그대로 유지됩니다.</p></div><button data-close data-rpcm-close="icon" aria-label="닫기">×</button></header><div class="rr-confirm-body"><p data-reason></p></div><footer class="rr-confirm-foot"><div class="rr-confirm-actions"><button data-continue>교정 없이 계속</button><button data-retry class="rr-primary">다시 검수</button></div></footer>';
+    box.querySelector('[data-reason]').textContent=String(error.message||error);
+    const close=()=>{overlay.remove();confirmOverlay=null;};
+    box.querySelector('[data-close]').onclick=close;
+    box.querySelector('[data-retry]').onclick=()=>{close();setTimeout(()=>runRefiner({force:true,targetOverride:target,maxOutputTokens:error.code==='REVIEW_OUTPUT_LIMIT'?32768:0,reviewMode:error.code==='AI_REQUEST_TIMEOUT'?'normal':''}),0);};
+    box.querySelector('[data-continue]').onclick=async()=>{
+      try{const fresh=await assertReviewSource(target,getChatId());markProcessed(fresh);addProcessHistory('원본 유지','사용자가 선택한 응답의 교정 없이 계속을 선택했습니다.',{target:fresh});close();setStatus('원본 유지');showReviewNotice('원본으로 계속합니다','사용자가 교정을 적용하지 않고 계속하기를 선택했습니다.','info');}catch(e){toast(e.message,'error');}
+    };
+    overlay.append(box);document.body.append(overlay);
+  }
+
+  function renderCorrectionComparison(card,before,after) {
+    const a=String(before||''),b=String(after||'');
+    const left=card.querySelector('[data-before]'),right=card.querySelector('[data-after]');
+    const append=(node,text,changed)=>{if(!text)return;const part=changed?document.createElement('mark'):document.createTextNode(text);if(changed)part.textContent=text;node.append(part);};
+    const tokenize=text=>text.match(/[\p{L}\p{N}_]+|\s+|[^\p{L}\p{N}_\s]/gu)||[];
+    const aa=tokenize(a),bb=tokenize(b);
+    // 큰 전체 응답은 제한된 공통 앞/뒤 비교로 표시해 UI 비용을 제한합니다.
+    if(aa.length*bb.length>80000||aa.length+bb.length>2000){
+      let start=0,aEnd=a.length,bEnd=b.length;
+      while(start<a.length&&start<b.length&&a[start]===b[start])start++;
+      while(aEnd>start&&bEnd>start&&a[aEnd-1]===b[bEnd-1]){aEnd--;bEnd--;}
+      for(const [node,text,end] of [[left,a,aEnd],[right,b,bEnd]]){append(node,text.slice(0,start),false);append(node,text.slice(start,end),true);append(node,text.slice(end),false);}
+    }else{
+      const rows=Array.from({length:aa.length+1},()=>new Uint16Array(bb.length+1));
+      for(let i=aa.length-1;i>=0;i--)for(let j=bb.length-1;j>=0;j--)rows[i][j]=aa[i]===bb[j]?rows[i+1][j+1]+1:Math.max(rows[i+1][j],rows[i][j+1]);
+      let i=0,j=0;
+      while(i<aa.length||j<bb.length){
+        if(i<aa.length&&j<bb.length&&aa[i]===bb[j]){append(left,aa[i++],false);append(right,bb[j++],false);}
+        else if(i<aa.length&&(j===bb.length||rows[i+1][j]>=rows[i][j+1]))append(left,aa[i++],true);
+        else append(right,bb[j++],true);
+      }
+    }
+    if(!a)left.textContent='(없음)';if(!b)right.textContent='(없음)';
+  }
+
+  function showCorrectionConfirm({target,corrected,reason,parsed=null}) {
+    return new Promise(resolve=>{
+      confirmOverlay?.remove();ensureThemeStyles();setReviewGate(target,'review-waiting-user');
+      window.__WISH_RP_MANAGER_AI_BRIDGE__?.reportRefinerIssue('proposal',reason,target.id);
+      const overlay=document.createElement('div');confirmOverlay=overlay;
+      overlay.id='wish-rpcore-refiner-confirm';overlay.className='wish-rpcore-refiner-ui';
+      overlay.style.cssText='position:fixed;inset:0;z-index:2147483646;background:var(--rr-scrim);display:flex;align-items:center;justify-content:center;padding:16px';
+      const box=document.createElement('section');
+      box.className='rr-confirm-box';box.setAttribute('role','dialog');box.setAttribute('aria-modal','true');box.setAttribute('aria-labelledby','rr-confirm-title');
+      box.innerHTML=`<header class="rr-confirm-head"><div class="rr-confirm-heading"><small>WISH · RESPONSE REVIEW</small><h3 id="rr-confirm-title">응답 교정 제안</h3><p>논리적 오류 단위로 선택하고, 전체 응답에서 실제 변경 위치를 확인하세요.</p></div><button type="button" data-close data-rpcm-close="icon" aria-label="닫기">×</button></header>
+        <div class="rr-confirm-body"><div class="rr-review-summary"><span data-verdict class="rr-verdict-pill"></span><p data-reason></p></div><p data-stale hidden>검수 중 원문이 바뀌었습니다. 최신 응답을 다시 검수해 주세요.</p>
+        <div class="rr-selection-bar"><span data-total-count></span><button data-act="all">전체 선택</button></div><div data-changes></div>
+        <details class="rr-full-preview" open><summary>선택 적용 후 전체 응답 미리보기</summary><div data-change-preview tabindex="0" aria-label="선택 교정 전체 응답 미리보기"></div><p class="rr-preview-hint">반전된 부분이 선택한 교정으로 바뀌는 글자입니다. 〔삭제〕는 제거될 부분입니다. 항목을 켜고 꺼도 현재 읽던 위치를 최대한 유지합니다.</p></details>
+        <div data-manual-editor-wrap hidden><strong>직접 수정 · 최종 적용 텍스트</strong><textarea data-manual-editor aria-label="직접 수정 최종 교정 응답" spellcheck="false"></textarea><small>직접 수정 중에는 교정 항목 선택이 잠깁니다. 위 강조 미리보기는 AI 제안 기준으로 유지되고, 이 편집본이 실제 서버 적용 대상입니다.</small></div>
+        <label class="rr-exception"><input type="checkbox" data-exception> 원본 유지 시 이 검수 유형을 예외로 저장</label>
+        <input data-policy hidden aria-label="교정 예외 적용 범위" placeholder="허용할 표현과 적용할 장면을 직접 입력하세요"></div>
+        <footer class="rr-confirm-foot"><div class="rr-foot-note"><span data-selection-count></span><span>같은 오류에 묶인 변경은 함께 적용됩니다.</span></div><div class="rr-confirm-actions"><button data-act="keep">원본 유지</button><button data-act="memory">기억 오류로 표시</button><button data-act="review" hidden>최신 응답 다시 검수</button><button data-act="copy">교정본 복사</button><button data-act="manual">직접 수정</button><button data-act="apply" class="rr-primary">선택한 수정 적용</button></div></footer>`;
+      box.querySelector('[data-reason]').textContent=reason;
+      box.querySelector('[data-verdict]').textContent=(REVIEW_VERDICT_LABELS[parsed?.verdict]||'교정 제안')+(parsed?.verdict==='CONTINUITY_DRIFT'?' · 연속성 수정은 직접 확인 후 선택하세요.':'');
+      const reviewChatId=getChatId();
+      const groups=correctionIssueGroups(target.content,parsed||{refined_text:corrected,reason});
+      const units=groups.flatMap(group=>group.units);
+      const list=box.querySelector('[data-changes]'),preview=box.querySelector('[data-change-preview]'),manualWrap=box.querySelector('[data-manual-editor-wrap]'),ta=box.querySelector('[data-manual-editor]'),manualBtn=box.querySelector('[data-act="manual"]'),apply=box.querySelector('[data-act="apply"]'),allBtn=box.querySelector('[data-act="all"]');
+      const checks=groups.map((group,index)=>{
+        const card=document.createElement('article');card.className='rr-change-card';
+        card.innerHTML='<header class="rr-change-head"><label><input type="checkbox"><strong></strong></label><small data-item-verdict class="rr-change-meta"></small></header><p class="rr-change-reason"></p><div data-issue-comparisons></div><details class="rr-evidence"><summary>판정 근거 보기</summary><p></p></details>';
+        const label=REVIEW_TOPICS[group.category]?.label||'응답';
+        card.querySelector('strong').textContent=`${index+1}. ${label} 수정${group.units.length>1?` · 연동 ${group.units.length}개`:''}`;
+        card.querySelector('.rr-change-reason').textContent=group.reason||reason;
+        card.querySelector('[data-item-verdict]').textContent=(REVIEW_VERDICT_LABELS[group.verdict||parsed?.verdict]||'검토 필요')+' · '+(group.severity==='confirmed'?'확정 근거':'직접 확인 필요');
+        const host=card.querySelector('[data-issue-comparisons]');
+        group.units.forEach((unit,unitIndex)=>{
+          const compare=document.createElement('div');compare.className='rr-compare';compare.innerHTML='<div><small></small><p data-before></p></div><div><small></small><p data-after></p></div>';
+          compare.querySelector(':scope > div:first-child small').textContent=group.units.length>1?`원문 · 연동 변경 ${unitIndex+1}`:'원문';
+          compare.querySelector(':scope > div:last-child small').textContent=group.units.length>1?`교정 제안 · 연동 변경 ${unitIndex+1}`:'교정 제안';
+          renderCorrectionComparison(compare,unit.from,unit.to);host.append(compare);
+        });
+        card.querySelector('details p').textContent=[group.evidenceSource,group.evidence||parsed?.evidence||'근거 출처가 제공되지 않았습니다. 원문과 저장 기억을 직접 확인해 주세요.'].filter(Boolean).join('\n');
+        const check=card.querySelector('input');check.checked=group.verdict!=='CONTINUITY_DRIFT'&&(group.verdict||parsed?.verdict)!=='CONTINUITY_DRIFT';check.onchange=renderSelection;list.append(card);return check;
+      });
+      box.querySelector('[data-total-count]').textContent=`수정 이슈 ${groups.length}개 · 실제 변경 ${units.length}개`;
+      if(!groups.length){const empty=document.createElement('p');empty.className='rr-empty-changes';empty.textContent='자동으로 적용할 수정 구간을 찾지 못했습니다. 판정 근거를 확인하거나 직접 수정 모드를 사용할 수 있습니다.';list.append(empty);}
+      let stale=false,busy=false,editMode=false,generatedText=corrected;
+      function selectedGroups(){return groups.filter((_,index)=>checks[index]?.checked);}
+      function selectedUnits(){return selectedGroups().flatMap(group=>group.units);}
+      function currentFinalText(){return editMode?ta.value:generatedText;}
+      function selectionReason(){const rows=selectedGroups().map((group,index)=>`${index+1}. ${group.reason}`).filter(Boolean);return rows.length?rows.join('\n'):reason;}
+      function updateApplyState(){const changed=normalizeCrackLinebreaks(currentFinalText())!==normalizeCrackLinebreaks(target.content);apply.disabled=stale||busy||!changed;}
+      function renderSelection(){
+        if(editMode)return;
+        const anchor=capturePreviewScrollAnchor(preview),chosen=selectedUnits();generatedText=applyCorrectionUnits(target.content,chosen);ta.value=generatedText;renderCorrectionPreview(preview,target.content,chosen);restorePreviewScrollAnchor(preview,anchor);
+        checks.forEach(check=>check.closest('article').dataset.selected=String(check.checked));
+        box.querySelector('[data-selection-count]').textContent=`${selectedGroups().length} / ${groups.length}개 이슈 선택 · ${chosen.length}개 변경`;
+        allBtn.textContent=selectedGroups().length===groups.length&&groups.length?'전체 해제':'전체 선택';updateApplyState();
+      }
