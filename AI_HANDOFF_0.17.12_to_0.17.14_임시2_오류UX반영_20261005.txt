@@ -1,0 +1,506 @@
+﻿Wish-RP-Manager 0.17.12 → 0.17.14 후속 원작자 버전 인수인계 · AI용
+작성일: 2026-10-05
+범위: 원작자 .12와 현재 전달 .14의 차이 및 후속 원작자 코드 반영 계약
+
+============================================================
+A. 기준 파일과 작업 원칙
+============================================================
+
+BASE_0_17_12: Wish-RP-Manager_v0.17.12.txt
+SHA-256: b2b432db588931758c072edc6ed16d288e0ccf80d1576e56203ee3939eb99817
+크기: 4,874,641 bytes / 원본은 BOM 없음.
+
+PATCHED_REFERENCE_0_17_14: 위시 RP Manager_0.17.14_임시2_오류도움_UI보강.txt
+SHA-256: ef272417ce692ca06593637b76da208cd9c34c1aac9dd025ab1e24b8f9476a49
+크기: 4,966,836 bytes / UTF-8 BOM / CRLF.
+@version/APP.version/중복 실행 표기: 0.17.14 / releaseStage: 임시2.
+
+NEW_UPSTREAM: 원작자가 이후 지정하는 실제 새 코드. 현재 검증은 위 두 파일 기준이다.
+안정성 > 속도 > 기능. 새 upstream이 이미 동등하거나 더 강한 안전장치·저장 구조를 갖고 있으면 이를 유지하고 아래 기능 계약을 맞춘다. 현재 .14 전체를 새 upstream에 덮어쓰거나 파일 이름만 바꾸지 않는다.
+
+이 문서는 변경 전달 자료다. 실제 사용자의 요청 없이 외부 업로드·배포·버전 변경을 실행하는 지시가 아니다. 로컬 .14의 후속 결함 수정에서는 내부 0.17.14를 유지하고 임시2/임시3처럼 임시 숫자만 올린다. 원작자 새 release의 번호는 원작자/사용자 지시에 따른다.
+
+과거 .11→.12 보고서의 기준 파일·TEST 역할·시험 수·성능 계산을 이번 .12→.14 결과로 복사하지 않는다. 이 문서의 hash를 기준으로 정확한 입력을 식별한다.
+
+============================================================
+B. .12 대비 변경 계약 한눈에 보기
+============================================================
+
+1. Quick: 저장된 미주입 character/extra를 이번 pending에 임시추가하고 quickManualInjection을 보호. 재추가·소진턴·suppression·실패 복구·그룹/접힘/행 안정화.
+2. Theme: accent/surface palette와 파생 명암. RPCM_custom_accent_v1 / RPCM_custom_surface_v1 유지.
+3. Character: autoCharacterIncludeUnchecked 기본 false. manual OFF의 RP 등장 자동선택을 사용자 옵션으로 허용. autoExcluded/manual ON/pin/Quick 권한 구분. ON→OFF 즉시 동기화와 서버 보상 복구.
+4. Full Read: 기존 .12 안전 body 유지, 최종 loadManualCompletedTurns의 options 전달 보완.
+5. Full Rebuild: 엄격한 실제 source/PART 검증, generation drift 경고/현재 Diff, 선택영역 서명, 최신 runtime/Quick 병합, 쓰기 직전/직후 경합 검증과 late edit 보존.
+6. Integrated: updated/unchanged baseline 검증, 현재 처리 범위 이후 backlog 안내, selected content conflict와 runtime/비선택 rebase 구분.
+7. External: 신규 JOB_ID 필수·모든 명시 ID 검사·legacy 생략 호환·BOM/CRLF, 메모/지침 drift와 실제 대상 변경 구분, 긴 RP 조회 후 최신 장기기억 inventory.
+8. Compression: 자동감지 메타를 본문 충돌과 구분, custom lore guide, stable-v3와 v2/v1/legacy 개별 서명 호환.
+9. AI memory: autoChosenByRp를 본문 변화로 오인하지 않도록 snapshot 정규화.
+10. Error UX: 공통 오류 도움말(hover/click/focus), 실제 detail·해결순서 표시, provider+model stale AI 상태 차단, AI 요약 연결 테스트 상태 영구 갱신.
+
+============================================================
+C. .12에서 보존할 안전장치와 기존 기능
+============================================================
+
+Full Read/FastLog, cache/single-flight/finalFresh, ZIP STORE/UTF-8 filename/CRC/cooperative yield, JSON Repair/Hold/진단/carrier inspector와 Refiner UI·원문 재검증은 .12에서 이미 존재한다. 신규 .14 기능으로 중복 구현하지 않는다.
+
+대표 기존 안전 body 동일성 검사는 rpcmHistoryContext, rpcmAssertHistoryContext, rpcmHistorySleep,
+rpcmHistoryPage, rpcmPhysicalCompletedTurns, rpcmSharedFullCompletedTurns, rpcmSubscribeHistoryFlight,
+rpcmTryHistoryCache, rpcmInstallHistoryCache, loadRpcmCompletedRange, rpcmCrc32, rpcmBuildStoreZip,
+normalizeReviewResult, applyCorrection, showCorrectionConfirm, waitForCrackEditDialogToClose,
+longTermNativePoll, parseFullRebuildJson, startCompat, bindLoreSection을 포함한다.
+
+- 긴 읽기/재시도/대기는 취소가 실제 read까지 전파되며 room/route epoch/revision/context 변경을 거부해야 한다.
+- shared flight에서 한 subscriber의 취소가 다른 subscriber 전체를 중단시키지 않는 기존 계약 유지.
+- finalFresh/control/onProgress options가 pager와 실제 물리 읽기 경로까지 전달되어야 한다.
+- Refiner empty from/duplicate from/source mismatch fail-closed, native edit 직전 source 재검증/guardNativeEdit 유지.
+- Refiner 선택/직접수정 모드·logical issue atomicity·bridge/readback 기존 계약 유지.
+- CRC yield를 줄이거나 observer/polling을 새로 추가하여 편의 UI를 우회 해결하지 않는다.
+- source/PART/manifest/hash 오류를 advisory로 바꾸거나 acceptedDataHashes 방식으로 수용하지 않는다.
+
+============================================================
+D. Quick / 캐릭터 정책 / carrier 복구
+============================================================
+
+autoCharacterIncludeUnchecked는 방별 필드이며 getRoom/normalizeRoomSlots에서 false 기본값이다. syncOpenModalIntoRoom/backupRoomSignature/renderModal, 감지와 주입 판정 경로를 함께 반영한다. checkbox만 추가하면 실제 정책 이식은 불완전하다.
+
+OFF: manualInjectionOverride='off' 캐릭터 자동 재선택 금지, .12 동작 유지.
+ON: character이고 RP 등장 근거가 있으며 autoExcluded가 아니면 메인 OFF라도 현재 자동선택 가능.
+개별 자동선택 제외는 전역 ON보다 우선. manual ON/autoPinned 권한 유지. 미등장 시 자동 OFF 복귀.
+Quick 강제선택은 별도 현재 pending 권한. item이나 모든 동적 기억의 자동선택 정책으로 새지 않음.
+
+quickUninjectedSlotRows / applyQueuedQuickChanges:
+- 새 임시추가뿐 아니라 quickRemovedItems에서 복원한 character/extra에도 quickManualInjection=true.
+- 메인 enabled를 영구 ON으로 바꾸지 않는다.
+- totalTurns>0 && usedTurns>=totalTurns일 때만 usedTurns=0. 진행 중 사용량과 무기한(totalTurns=0) 의미 유지.
+- suppressed 항목은 즉시 자동 재추가하지 않음. pending/Quick rollback 유지.
+- 날짜로그/자료집 검색/AI 산출물에 character/extra 수동 권한을 일괄 적용하지 않음.
+
+ON→OFF handler:
+이전 옵션·enabled·pending snapshot → 자동감지 때문에 켜진 manual OFF를 즉시 OFF → Quick 강제추가 유지 → carrier 동기화/로컬 저장.
+실패하면 local snapshot 복구. 서버가 이미 반영되었거나 반영 가능성이 있으면 이전 carrier로 보상 sync.
+syncPendingCarrierNow의 rpcmCarrierNeedsRollback 신호는 실제 쓰기 시도 후 실패/자체 rollback 검증 여부를 상위 handler에 전달한다.
+복구 확인도 실패하면 verified=false / policyRollbackError / 복구 백업을 유지하고 성공으로 숨기지 않는다.
+
+============================================================
+E. 실제 내용과 휘발성 runtime 분리
+============================================================
+
+lastAutoDetectedAt/lastAutoMatch/lastAutoConfidence/lastAutoReason은 자동감지 메타다.
+정해진 slot/압축 row의 최상위 enabled/autoChosenByRp는 현재 사용 상태로 분리한다.
+실제 content, nested enabled, inject, mode, userLocked, managedBy, manualInjectionOverride, 선택영역 checkpoint는 보호한다.
+
+fullRebuildStableValue는 정해진 자동감지 필드를 재귀 제외한다.
+fullRebuildStableSlot은 slot 최상위 runtime만 제외한다.
+fullRebuildSelectedSignature는 영역별 내용·설정·체크포인트를 비교한다.
+fullRebuildRestoreSlotRuntime/mergeFullRebuildSelections는 현재 live runtime/pending/Quick를 보존한다.
+모든 enabled를 무조건 제거하지 않는다. lore pack.enabled는 사용자 설정이며 새 압축 stable-v3에 포함한다.
+
+캐릭터/OOC 본문 같은 사용자 고정형, 검색/날짜로그/AI 갱신 같은 동적형, 자동선택과 사용자 override가 섞이는 항목의 내부 권한을 구분한다. UI는 하나의 Quick Monitor로 유지해도 된다.
+
+============================================================
+F. Full Rebuild: .12 대비 검증/commit 변경
+============================================================
+
+parseFullRebuildJson: 결과 source/parts/guides는 생성 job과 정확히 맞아야 한다.
+assertFullRebuildSource: 역사 prefix 수정/삭제/축소/branch/reroll은 hard reject. 뒤에 추가된 RP는 newerTurns로 남긴다.
+assertFullRebuildPartsManifest/assertFullRebuildPartsAgainstSource: index/total/turn 경계/개수/sha256을 실제 source와 대조한다. wrapper 정규화가 구조 검증 완화 수단이 되어서는 안 된다.
+synchronizeFullRebuildStoredRoomStrict: 현재 room/job/stale 검사 → 현재 save → readback. 저장 도중 실제 경합은 계속 거부한다.
+fullRebuildSoftDrift: 생성 뒤 기억/메모/current guide 변화는 경고로 분리하고 현재 Diff를 계산한다. imported guide manifest가 생성 당시 job과 다른 경우는 계속 거부한다.
+prepareFullRebuildResult: 영역별 Diff/baseDomainSignatures. invalid 영역은 적용 불가.
+
+commitFullRebuildResult 순서:
+선택영역 서명 → source/PART 재검증 → 현재 저장본 동기화 → characterLibraries 조회 완료 → room/epoch/job/stale/선택영역 재검증 → 최신 candidate 병합 → checkpoint/receipt/백업 → atomic transaction → readback → receipt finalize → late edit 보존/저장 → pending/carrier 갱신.
+
+비동기 경합 보호:
+1) candidate 생성 전에 설정집 조회를 끝내고 재검증하여 조회 중 생긴 최신값을 반영.
+2) commit 시작 routeEpoch를 최종 put 직전에도 비교.
+3) writeBase는 미리보기 시대의 전체 JSON이 아니라 최종 후보 생성 시점의 현재 JSON.
+4) stampVerifiedResult/fullRebuildSoftDrift 등 대기 후 put 직전 live==writeBase, storedSnapshot, selected signature, room/epoch/job/stale를 확인.
+5) premerge runtime/Quick/비선택 변화는 병합. candidate 생성 이후 쓰기 구간의 변화는 안전하게 abort하여 재검토.
+6) readback은 live room이 아니라 실제 candidate와 비교. 확인 중 생긴 편집은 성공 판정을 왜곡하지 않도록 별도 보존.
+7) finalize 뒤 rpcmKeepLateEdits(writeBase,live,verified), baseline은 verified 저장본으로 기록, lock 해제 후 late-edit save.
+8) 삭제된 item의 pending/quickRemoved 참조 정리, 사용 진행/Quick 권한 보존. append RP는 checkpoint 밖의 다음 갱신으로 남김.
+
+transaction 전 거부와 transaction 후 readback/finalize 오류를 구분한다. 후자는 DB에 이미 쓴 상태일 수 있으므로 '미저장'으로 단정하지 않는다. 확인 실패는 완료로 표시하지 않고 자동 백업과 저장본을 확인한다. local 기억 commit과 carrier 반영 실패도 별도 상태다.
+
+============================================================
+G. Integrated: .12 대비 baseline/현재값 병합
+============================================================
+
+assertIntegratedSource는 원문 prefix 검증을 유지하고 append는 다음 갱신으로 남긴다. generation 이후 로컬 drift만으로 전체 패킷을 일괄 폐기하지 않는다.
+prepareIntegratedResult는 updated뿐 아니라 unchanged도 assertIntegratedUnchangedBaseline으로 영역별 기존 본문/checkpoint를 검사한다. prepared에는 baseDomainSignatures를 담는다. 과거 preview 객체는 baseSnapshot에서 서명을 복원하는 호환 경로를 유지한다.
+commitIntegratedResult는 selected 실제 본문/설정/override/checkpoint 변경을 차단하며 runtime/Quick/비선택 변화는 최신값으로 병합한다.
+
+source → scoped guard → save current → guard → read stored → guard → 최신 writeBase 일치 → candidate/receipt → transaction에서 stored/live/room/epoch/job/stale 확인 → readback/finalize → late edit 보존/저장.
+
+Diff 시점부터 전체 room JSON 불변을 요구하는 조건을 되살리지 않는다. 반대로 selected 내용 충돌·최종 저장본/live 비교는 제거하지 않는다. backlog 문구는 '패킷 처리 범위 뒤에 현재 남아 있는 턴'을 기준으로 정확히 설명한다.
+
+============================================================
+H. 외부 수동/자료집/장기기억 결과
+============================================================
+
+신규 resultJobIdRequired job은 적어도 한 JOB_ID가 필요하다. 입력의 모든 명시 ID를 모아 현재 job과 대조한다. 여러 파일/줄 중 뒤의 다른 ID도 정상 import에서 거부한다. 각 파일에 반드시 별도 헤더를 요구하는 계약으로 바꾼 것은 아니다.
+legacy/optional은 생략을 허용하지만 명시된 잘못된 ID는 차단한다. 수동 draft.recovery의 기존 명시 복구 예외는 유지한다. 복구 예외를 일반 import의 ID 보호 우회로 넓히지 않는다.
+
+manualRawResultInputs에서 ID를 검사하고, manualResultInputs로 JOB_ID/BOM을 정규화하여 입력 내용 대조를 수행한다.
+prepareManualLoreResult.rawInputs도 동일 정규화 기준을 사용하여 정상 자료집 결과의 Diff→commit을 보장한다. 헤더를 제거한 뒤 ID 검사를 생략하지 않는다.
+
+메모/current guide/휘발성 drift는 필요한 경고·현재값 재검토로 구분한다. 실제 대상/source/job/inventory conflict는 차단한다.
+장기기억 inventory snapshot은 긴 RP read 뒤 최신 시점으로 이동했다. non-target 새 항목을 generation-era 목록으로 덮어쓰지 않는다.
+최종 packet 600,000자 경계와 결과 안전 한도를 검사한다.
+JSON Repair는 local syntax/schema를 고친 뒤 정상 parse→prepare→Diff→commit으로 돌아온다. source/hash/room/job/stale는 repair로 수용하지 않음. Hold 재개도 room/route/job guard를 유지한다.
+
+============================================================
+I. Compression: 새 서명/구결과 호환
+============================================================
+
+외부 format WISH_COMPRESSION_V1 유지. 새 job.signatureSchema는 stable-v3. 내부 extension version 0.17.14와 DB version 2 유지.
+compressionStableSignatureSource: row 자동감지 runtime 제외, 실제 content/구조/inject/mode/lock/관리주체 유지, pack의 id/enabled/userLocked/managedBy 포함.
+compressionEntries: signature(v3), stableV2Signature(과거 pack.enabled 없는 규칙), stableV1Signature(fullRebuildStableValue 원래 규칙), legacySignature(원래 JSON)를 각각 계산.
+compressionPreview는 job이 기록한 schema의 서명만 사용한다. v3 불일치를 v2/legacy로 재시도하여 수용하지 않는다.
+
+구 stable-v2에는 생성 당시 pack.enabled가 없어 사후 확인할 수 없다. 기존 hash 계약으로 읽고 현재 pack 설정을 보존한다. 새 v3부터 pack.enabled 변경도 차단한다. 본문/inject/mode/lock/최종 저장 보호는 이전 job에도 유지.
+RP 조회 후 최신 room entries/context를 함께 snapshot한다. 사용자 메모/현재상태/person/timeline/lore guide를 반영하며 lore는 manualLoreGuideSlot(room).text로 사용자 지침을 사용한다.
+source 변조/대상 변경/중복 ref/병합 범위·group/필수내용·크기/최종 저장 경합 보호 유지.
+
+============================================================
+I-1. 임시2 오류 UX / AI 상태 정합성 추가 계약
+============================================================
+
+이 절은 임시1 → 임시2에서 추가된 변경이다. 0.17.14 숫자 버전과 DB/기억 구조는 그대로 유지한다.
+
+[AI 상태 stale 방지]
+aiFeatureCurrentStatus(settings, feature, providerOverride, modelOverride):
+- 저장된 featureStatus는 status.provider/status.model이 현재 기능의 provider/model과 정확히 일치할 때만 유효하다.
+- 모델 또는 제공자를 바꾸면 이전 모델의 ok/error를 현재 모델 상태로 재사용하지 않는다.
+- 현재 모델에서 아직 검사하지 않았다면 메인 UI는 “확인 전”으로 돌아가야 한다.
+- 기능별 API 설정의 상태 행과 메인 AI 상태 칩, itemFolder lastRun 판정도 이 경로를 사용한다.
+
+[AI 요약 창 자체의 연결 테스트]
+openAiSummaryDialog의 연결 테스트:
+- 성공 시 setAiFeatureStatus('summary','ok', 실제 provider/model, ...)를 호출한다.
+- 실패 시 classifyAiFailure(error) 결과의 category/detail을 setAiFeatureStatus('summary','error', ...)로 저장한다.
+- 성공/실패 후 renderModalIfOpen()으로 뒤쪽 메인 AI 상태도 다시 렌더링한다.
+- 단순히 팝업의 임시 문구만 바꾸고 저장된 과거 오류를 남겨 두는 구현으로 되돌리지 않는다.
+
+[공통 오류 도움말]
+기존 rpcmErrorAdvice 분류를 재사용하고 다음 신규 helper를 유지한다.
+- rpcmErrorHelpInfo
+- rpcmErrorHelpAttrs
+- rpcmSetErrorHelp
+- rpcmClearErrorHelp
+- rpcmErrorHelpCandidate
+- rpcmEnsureErrorHelpUi
+- rpcmPositionErrorHelp
+- rpcmShowErrorHelp
+- rpcmHideErrorHelp
+- rpcmBindErrorHelp
+
+RPCM_ERROR_HELP_SELECTOR는 적어도 다음 실제 오류 표면을 포괄한다.
+- AI error chip / API state / AI status / validation
+- AI utility / 중요 물품 AI 폴더
+- local save / carrier sync
+- story review / person import / long-term error
+- notice error / semantic search error / error toast
+
+동작 계약:
+- hover 또는 focus: 임시 도움말 표시.
+- click: 같은 도움말 고정.
+- 바깥 click 또는 × 또는 Esc: 고정 도움말 닫기.
+- 도움말에는 오류 종류, 실제 오류 원문, 사용자가 먼저 확인할 해결 순서를 표시.
+- 상세 오류가 저장되지 않은 기존 UI는 텍스트를 기반으로 fallback 분류·일반 해결 절차를 표시.
+- 도움말 때문에 원래 button/input/select의 기능을 가로채지 않는다.
+- window/document 전역 이벤트는 rpcmErrorHelpBound로 한 번만 바인딩한다.
+
+[오류 원문 보존]
+- local autosave 실패는 state.lastSaveError에 실제 message를 저장하고 updateSaveStatusUi가 이를 도움말에 사용한다.
+- carrier sync 실패는 finishCarrierSyncStatusUi(..., error)가 detail을 보존하고 renderCarrierSyncStatusUi가 이를 표시한다.
+- semantic search / AI utility / item-folder status는 error 상태가 되면 rpcmSetErrorHelp를 붙이고 정상 상태에서는 제거한다.
+- notice popup/center와 error toast는 공통 오류 도움말 후보가 된다.
+- “인증 필요” 칩은 현재 provider의 인증 정보가 없다는 명시적 원인과 API·모델 설정에서의 해결 순서를 제공한다.
+
+[분류]
+rpcmErrorAdvice가 이미 제공하던 App Check, 저장공간 한도, 429/rate/quota, 기준 턴·checkpoint,
+JSON/결과 형식, 동시 저장 충돌, IndexedDB/저장, 401 인증, 403 권한, 404/model,
+network/timeout/CORS, token/context length 계열을 공통 도움말에서도 사용한다.
+분류되지 않는 오류는 실제 오류 원문을 숨기지 않고 일반 해결 절차와 함께 표시한다.
+
+[안전 경계]
+오류 도움말은 진단 UI다. 자동 데이터 삭제, IndexedDB 초기화, 강제 덮어쓰기, 쓰기 자동 재시도,
+source/hash/job/stale 검증 완화, carrier 복구 성공 간주를 수행해서는 안 된다.
+저장/검증 오류에서는 기존 fail-closed·백업·복구 불확실성 표시를 그대로 유지한다.
+
+============================================================
+J. 주요 앵커와 실제 실행 구현
+============================================================
+
+행 번호는 위 전달 hash에만 해당한다. 수정 후 역할/이름으로 다시 찾는다.
+- getRoom: 14242행
+- normalizeRoomSlots: 6892행
+- syncOpenModalIntoRoom: 8138행
+- backupRoomSignature: 17939행
+- characterUncheckedAutoSelectionAllowed: 15263행
+- rpShouldInjectSlot: 15269행
+- autoDetectCharacters: 19426행
+- quickUninjectedSlotRows: 16530행
+- applyQueuedQuickChanges: 18856행
+- reconcilePendingSlotsWithCurrentSelection: 15302행
+- syncPendingCarrierNow: 18523행
+- renderModal: 35177행
+- prepareManualLoreResult: 25856행
+- manualRawResultInputs: 27572행
+- manualResultInputs: 27580행
+- assertManualJobCurrent: 28044행
+- prepareIntegratedResult: 26989행
+- assertIntegratedUnchangedBaseline: 26974행
+- commitIntegratedResult: 27007행
+- fullRebuildStableValue: 29125행
+- fullRebuildStableSlot: 29132행
+- fullRebuildRestoreSlotRuntime: 29137행
+- fullRebuildSoftDrift: 29169행
+- synchronizeFullRebuildStoredRoomStrict: 29151행
+- fullRebuildSelectedSignature: 29617행
+- assertFullRebuildPartsManifest: 29287행
+- assertFullRebuildPartsAgainstSource: 29300행
+- commitFullRebuildResult: 29654행
+- longTermBuildExternalPacket: 30233행
+- longTermImportExternal: 30382행
+- compressionStableSignatureSource: 32271행
+- compressionEntries: 32281행
+- compressionPreview: 32314행
+- createCompressionPacket: 32359행
+- aiMemoryComparableSnapshot: 34484행
+- applyRpcmAccentTheme: 4222행
+- applyRpcmSurfaceTheme: 4238행
+- aiFeatureCurrentStatus: 4869행
+- rpcmErrorAdvice: 6222행 (기존 분류 함수, 임시2 공통 도움말에서 재사용)
+- rpcmErrorHelpInfo: 6260행
+- rpcmErrorHelpAttrs: 6276행
+- rpcmSetErrorHelp: 6281행
+- rpcmClearErrorHelp: 6292행
+- rpcmErrorHelpCandidate: 6311행
+- rpcmEnsureErrorHelpUi: 6323행
+- rpcmPositionErrorHelp: 6352행
+- rpcmShowErrorHelp: 6363행
+- rpcmHideErrorHelp: 6373행
+- rpcmBindErrorHelp: 6380행
+- openAiSummaryDialog: 21245행
+- updateSaveStatusUi: 14357행
+- renderCarrierSyncStatusUi: 14373행
+- finishCarrierSyncStatusUi: 14405행
+
+후반 assignment override 11개: 원 선언만 보면 실제 실행 경로를 놓칠 수 있다.
+- apiRequest: 38230행 (후반 재할당)
+- createRpcmTurnPager: 38260행 (후반 재할당)
+- loadRpcmCompletedRange: 38315행 (후반 재할당)
+- loadManualCompletedTurns: 38321행 (후반 재할당)
+- openFullRebuildImportDialog: 38343행 (후반 재할당)
+- openIntegratedImport: 38355행 (후반 재할당)
+- recordRpcmIssue: 38373행 (후반 재할당)
+- openRpcmIssueLogDialog: 38377행 (후반 재할당)
+- showFullRebuildFilesDialog: 38398행 (후반 재할당)
+- openManualRpExportDialog: 38416행 (후반 재할당)
+- bindFullRebuildTools: 38427행 (후반 재할당)
+최종 loadManualCompletedTurns(room,options={})는 loadRpcmCompletedRange(room,[],options)로 전달한다. openFullRebuildImportDialog/openIntegratedImport도 마지막 구현의 strict source/scoped validation/Repair/Hold까지 보아야 한다.
+
+============================================================
+K. .12 대비 코드 변경 전수 목록
+============================================================
+
+아래 .12 대비 named declaration 통계(1,430개/동일 1,373개/본문 변경 57개/신규 43개)는 임시1까지의 분석 기록이다.
+임시2에서는 오류 UX와 AI 상태 정합성 패치가 추가되어 현재 전달 파일 전체 통계를 새로 산출한 값으로 간주하지 않는다.
+익명 함수까지의 전수 의미 검증을 뜻하지 않으며, '#2'는 별도 IIFE의 같은 이름 선언을 구분하는 분석 키이고 실제 함수명을 바꾸라는 뜻이 아니다.
+함수 내부 handler/HTML/상수/metadata와 후반 assignment override는 전체 diff로 함께 검토한다. 함수 표에는 두 버전 행만 있다.
+
+[.12 기존 함수 중 본문 변경 57개]
+- normalizeRoomSlots
+- syncOpenModalIntoRoom
+- getRoom
+- rpShouldInjectSlot
+- reconcilePendingSlotsWithCurrentSelection
+- backupRoomSignature
+- syncPendingCarrierNow
+- closeQuickInjectionPanel
+- applyQueuedQuickChanges
+- renderQuickInjectionPanel
+- openQuickInjectionPanel
+- autoDetectCharacters
+- buildInjectionRecheckReport
+- reanchorAfterResponseNow
+- addStyles
+- addWishUiStyles
+- mobileManagerButtonStyles
+- prepareManualLoreResult
+- manualRememberDraft
+- loadManualCompletedTurns
+- assertIntegratedSource
+- prepareIntegratedResult
+- commitIntegratedResult
+- openIntegratedImport
+- createManualBatchPackets
+- manualResultInputs
+- prepareManualUpdateResult
+- rebaseManualReviewedResult
+- commitManualUpdateResult
+- assertManualJobCurrent
+- openManualUpdateResultDialog
+- fullRebuildDataView
+- createFullRebuildFiles
+- assertFullRebuildSource
+- prepareFullRebuildDomain
+- prepareFullRebuildResult
+- mergeFullRebuildSelections
+- fullRebuildSelectedSignature
+- alignFullRebuildCheckpoints
+- commitFullRebuildResult
+- fullRebuildToolStatus
+- openFullRebuildImportDialog
+- longTermBuildExternalPacket
+- longTermImportExternal
+- longTermAssertSource
+- longTermAssertSecond
+- longTermBind
+- longTermOpenBulkEdit
+- compressionEntries
+- compressionPreview
+- createCompressionPacket
+- compressionAssertSource
+- commitCompression
+- openCompressionImport
+- aiMemoryComparableSnapshot
+- renderModal
+- init
+
+[.14 신규 선언 43개]
+- applyRpcmAccentTheme
+- applyRpcmSurfaceTheme
+- assertFullRebuildPartsAgainstSource
+- assertFullRebuildPartsManifest
+- assertFullRebuildSelectedDomainsUnchanged
+- assertIntegratedUnchangedBaseline
+- bindManualResultJobId
+- bindQuickThemePicker
+- characterUncheckedAutoSelectionAllowed
+- compressionContextHash
+- compressionContextSnapshot
+- compressionSoftDrift
+- compressionStableSignatureSource
+- fullRebuildRestoreSlotRuntime
+- fullRebuildSoftDrift
+- fullRebuildStableSlot
+- fullRebuildStableValue
+- loadRpcmAccentTheme
+- loadRpcmSurfaceTheme
+- longTermAssertContextCurrent
+- longTermCurrentContextHash
+- longTermExternalSoftDrift
+- manualExternalCurrentContextHash
+- manualExternalSoftDrift
+- manualRawResultInputs
+- manualStripResultJobId
+- normalizeRpcmAccentHex
+- quickThemePickerHtml
+- quickThemePickerSectionHtml
+- quickUninjectedSlotRows
+- rpcmAccentInkForHex
+- rpcmCurrentAccentForPicker
+- rpcmCurrentSurfaceForPicker
+- rpcmHexToRgb
+- rpcmHsvToRgb
+- rpcmMixHex
+- rpcmRelativeLuminance
+- rpcmRgbToHex
+- rpcmRgbToHsv
+- rpcmSurfacePaletteForHex
+- saveRpcmAccentTheme
+- saveRpcmSurfaceTheme
+- synchronizeFullRebuildStoredRoomStrict
+
+[임시1 → 임시2 추가 변경]
+신규 named function:
+- aiFeatureCurrentStatus
+- rpcmErrorHelpInfo
+- rpcmErrorHelpAttrs
+- rpcmSetErrorHelp
+- rpcmClearErrorHelp
+- rpcmErrorHelpCandidate
+- rpcmEnsureErrorHelpUi
+- rpcmPositionErrorHelp
+- rpcmShowErrorHelp
+- rpcmHideErrorHelp
+- rpcmBindErrorHelp
+
+기존 선언/실행 경로 추가 변경:
+- openUtilityDialog: error status에 공통 도움말 attach/clear
+- openImportantItemAiFolderDialog: error status에 공통 도움말 attach/clear
+- notify / noticePopup / openNoticeCenter: error toast·알림을 공통 도움말 대상으로 연결
+- updateSaveStatusUi / queueRoomAutoSave: 실제 local save 오류 원문 보존·표시
+- renderCarrierSyncStatusUi / finishCarrierSyncStatusUi / syncPendingCarrier: carrier 실패 detail 보존·표시
+- openUnifiedApiSettingsDialog: 현재 provider/model 상태만 표시, API/semantic 오류 도움말 연결
+- openAiSummaryDialog: 연결 테스트 결과를 featureStatus에 실제 저장하고 메인 UI 갱신
+- addStyles / renderModal: 오류 칩 가시성 및 도움말 attrs, “인증 필요” 해결 안내
+- createSlotCard의 저장 실패 경로: state.lastSaveError 보존
+
+rpcmErrorAdvice와 rpcmActionableError 자체의 기존 분류 body는 임시1 대비 변경하지 않고 공통 도움말이 재사용한다.
+
+============================================================
+L. 현재 전달용 회귀와 재현
+============================================================
+
+임시1 기준 .12→.14 전용 regression_12_to_14.mjs는 174/174 PASS였다.
+현재 임시2에서는 오류 UX/AI 상태 패치 후 전달 코드에 대해 Node --check를 다시 통과했다.
+이번 문서 업데이트 입력에는 regression_12_to_14.mjs와 전체 test bundle이 포함되지 않았으므로,
+임시2 파일을 대상으로 174개 전체 회귀를 다시 실행했다는 의미로 바꾸어 기록하지 않는다.
+기존 안전 동일성/실제 policy·Quick·source·PART·ID·compression·integrated·receipt·late edit·write race·carrier 보상 실패 경계를 검사한다. 팔레트 파생색과 CSS 적용/해제는 실제 함수를 DOM mock으로 실행한다.
+구문/정적/실제 함수 Node VM + API/evidence/provider/IndexedDB callback/DOM mock이 섞여 있다. 174개 전부가 브라우저 시나리오는 아니다.
+실제 Crack/Tampermonkey/GM 네트워크/브라우저 IndexedDB E2E, 실제 감지 정확도, 시각·성능 실측 미실행.
+MutationObserver 생성 9 / setInterval 생성 5로 기준 대비 증가 없음. 실제 호출 횟수 측정은 아니다.
+
+[임시1 당시 회귀 묶음 재현]
+ZIP을 풀고 그 루트에서:
+  node --check repair_output/v14.user.js
+  node regression_12_to_14.mjs
+런타임: 당시 검증 Node v24.19.0. Node 표준 모듈만 사용, npm 의존성 없음.
+
+[현재 임시2 최소 구문 확인]
+현재 전달 TXT를 임시 .user.js 파일로 복사한 뒤:
+  node --check <임시2 복사본>.user.js
+현재 문서 갱신 시 이 구문 검사는 PASS했다.
+결과: handoff_output/test_results_12_to_14.json / .tsv.
+v12.user.js는 BOM을 추가한 검사 복사본, 원본 .12와 바이트 hash는 다르지만 decode 본문은 동일. 해당 회귀 묶음의 v14.user.js는 당시 임시1 전달 TXT와 바이트 동일했다. 임시2는 별도 현재 전달 파일이다.
+legacy_compression_functions_14.json은 과거 stable-v2/v1/legacy 알고리즘 두 함수의 reference다. 구 hash를 새 구현 자체와만 대조하지 않고 실제 이전 규칙과 비교하기 위해 제공한다. 이 reference는 upstream 전체 교체 코드가 아니다.
+
+174건 PASS는 모든 가능한 사용자 상황·내장 지침 의미·익명 closure/DOM/server 동작의 무결함을 인증하지 않는다. 실패 시 해당 경계를 수정하고 관련 회귀를 추가해 전체 검사를 다시 한다.
+
+============================================================
+M. 후속 원작자 코드에 반영할 절차
+============================================================
+
+1. 새 upstream와 reference hash/metadata를 기록하고 이미 존재하는 계약부터 확인.
+2. .12→현재 .14 전체 diff·함수표에서 기능과 safety 변경을 묶어서 검토.
+3. 동등하거나 더 강한 최신 upstream 구현은 유지. 더 오래된 body로 통째 교체하지 않음.
+4. options 전달은 실제 최종 override까지, 캐릭터 옵션은 default/normalization/backup/UI/detection/injection/rollback까지 반영.
+5. source/commit/receipt 변경은 F/G 전체 순서로 검토. 최종 runtime rebase와 selected content guard를 함께 보존.
+6. 새 source 전체 구문·관련 기능·기준 안전·저장 경합·기존 pending 하위호환 검사 수행.
+7. 원문/생성 지침 의미·강도·표현을 작업 범위 밖에서 변경하지 않음. DB/bridge/검색·회수/장기 RP 연속성 구조를 불필요하게 교체하지 않음.
+8. 코드 TXT(UTF-8 BOM/CRLF), 새 upstream 대비 diff, 일반 변경보고서, AI 인수인계, 결과와 미확인 범위를 제공. 원본 파일 덮어쓰기/외부 게시를 자동 실행하지 않음.
+9. 오류 UX를 이식할 때는 stale AI 상태 차단, 실제 detail 보존, hover/click/focus 도움말, 기존 fail-closed 저장·복구 경계를 한 묶음으로 확인.
+
+============================================================
+N. 실제 환경 확인 체크리스트 (미실행)
+============================================================
+
+1) 기존 방/새 방 옵션 기본 OFF, manual OFF 유지. ON 실제 등장·미등장·autoExcluded/manual ON/pin, item 영향 없음.
+2) Quick 캐릭터/OOC 추가→재정리 유지, 제거→자동 복원 안 됨, 재추가 진행중/소진턴, 접힘·행 안정성.
+3) ON→OFF enabled/pending/server carrier 즉시 일치. 저장 실패·server 반영 후 실패·보상 실패에서 복구/불확실 표시.
+4) 긴 Full Read 취소/방 이동/revision 변경, finalFresh와 subscriber 분리.
+5) Full Rebuild append/메모·지침/Quick/nonselected는 현재 Diff 및 backlog 보존. source/PART/hash/manifest/selected 변경은 거부.
+6) 실제 IndexedDB 다른 탭 쓰기·room 이동을 candidate 전후/put 전후/readback 중 각각 발생시켜 abort·late edit·backup 확인.
+7) Integrated updated/unchanged/selected 충돌/runtime rebase/backlog/receipt 경합.
+8) 외부 신규 ID 필수, 복수 같은 ID/다른 ID, legacy 생략, 명시 recovery, BOM/CRLF 자료집 Diff→commit.
+9) 새 v3 pack.enabled와 content/inject/mode/lock 변경 거부, 자동감지 메타 허용, 이전 v2/v1/legacy pending 재개, custom lore guide.
+10) Refiner native edit/source 재검증, empty/duplicate 거부, 직접수정·atomic 적용·bridge/readback.
+11) 큰 ZIP 응답/취소/URL 정리/파일명·내용·CRC, palette 저장·복원/실제 색상·화면 조작.
+12) 오류 도움말 hover/click/focus/Esc/바깥닫기, 모바일 위치, 실제 오류 원문 노출, provider/model 변경 뒤 stale 상태 제거, AI 요약 연결 성공/실패 후 메인 상태 갱신.
+
+이 체크리스트는 실제 수행 완료 근거가 아니다. 실제 환경 결과를 추가 기록하고 mock PASS와 구분한다.
