@@ -1,0 +1,1000 @@
+      workingCards = response.parsed.cards.map(card => ({ ...card, tags:[...(card.tags || [])] }));
+      changed = true;
+    }
+    assertStoryTimelineRunCurrent(room, run);
+    const finalText = JSON.stringify(changed ? { status:'CHANGED', cards:storyTimelineJsonCards(workingCards, run) } : { status:'NO_CHANGE', cards:[] }, null, 2);
+    const reviewedEndIndex = allTurns.findIndex(turn => String(turn.key) === String(snapshot.endKey));
+    const reviewedThrough = reviewedEndIndex >= 0 ? reviewedEndIndex + 1 : allTurns.length;
+    const reviewedTailKeys = allTurns.slice(0, reviewedThrough).slice(-40).map(turn => String(turn.key));
+    return {
+      id:`TLRUN_${Date.now().toString(36)}${Math.random().toString(36).slice(2,7)}`,
+      createdAt:nowIso(), provider, model:String(settings.models?.[provider] || ''), updateMode,
+      finalText, rawResult:lastRaw, noChange:!changed, usage, formatRetried,
+      run, masterSnapshot:run.masterSnapshot, masterSnapshotIds:run.masterSnapshot.map(card => String(card.cardId)),
+      preview:changed ? buildStoryTimelinePreview(workingCards, run) : null,
+      reviewScope:storyTimelineReviewScopeFromSnapshot(snapshot, selectedLogs, updateMode, reviewedTailKeys),
+    };
+  }
+
+  function validateStoryTimelineAudit(audit, cards, room, run, expectedScope) {
+    if (!audit || typeof audit !== 'object' || Array.isArray(audit)) throw new Error('audit 객체가 없습니다.');
+    const required = ['result','sourceScope','currentCount','recommendedCount','keep','update','merge','remove','split','addCount','lockedIssues','summary'];
+    for (const key of required) if (!(key in audit)) throw new Error(`audit.${key} 필드가 없습니다.`);
+    if (!['PASS','FAIL','UNVERIFIED'].includes(audit.result)) throw new Error('audit.result 값이 올바르지 않습니다.');
+    if (!['FULL','PARTIAL','TIMELINE_ONLY'].includes(audit.sourceScope)) throw new Error('audit.sourceScope 값이 올바르지 않습니다.');
+    if (expectedScope && audit.sourceScope !== expectedScope) throw new Error(`sourceScope 불일치: 요청 ${expectedScope}, 응답 ${audit.sourceScope}`);
+    if (audit.sourceScope === 'TIMELINE_ONLY' && audit.result === 'PASS') throw new Error('TIMELINE_ONLY에서 구조상 FAIL이 아니면 UNVERIFIED여야 합니다.');
+    const refs = new Set((run.refEntries || []).slice(0, run.masterSnapshot.length).map(item => String(item.ref)));
+    if (Number(audit.currentCount) !== run.masterSnapshot.length) throw new Error(`currentCount 불일치: 실제 ${run.masterSnapshot.length}, 응답 ${audit.currentCount}`);
+    for (const key of ['keep','update','remove','split','lockedIssues']) if (!Array.isArray(audit[key])) throw new Error(`audit.${key}는 배열이어야 합니다.`);
+    if (!Array.isArray(audit.merge)) throw new Error('audit.merge는 배열이어야 합니다.');
+    const classified = new Map();
+    const claim = (ref, kind) => {
+      if (!refs.has(ref)) throw new Error(`${kind}에 알 수 없는 REF가 있습니다: ${ref}`);
+      if (classified.has(ref)) throw new Error(`REF 판정이 충돌합니다: ${ref} (${classified.get(ref)} / ${kind})`);
+      classified.set(ref, kind);
+    };
+    for (const key of ['keep','update','remove','split']) for (const ref of audit[key].map(String)) claim(ref, key);
+    for (const group of audit.merge) {
+      if (!group || !Array.isArray(group.refs) || group.refs.length < 2) throw new Error('merge.refs에는 서로 다른 기존 REF가 2개 이상 필요합니다.');
+      const unique = [...new Set(group.refs.map(String))];
+      if (unique.length !== group.refs.length || !unique.includes(String(group.targetRef || ''))) throw new Error('merge.refs 중복 또는 targetRef 관계가 올바르지 않습니다.');
+      for (const ref of unique) claim(ref, 'merge');
+    }
+    for (const ref of refs) if (!classified.has(ref)) throw new Error(`기존 카드 판정이 누락되었습니다: ${ref}`);
+    const maps = storyTimelineRunRefMaps(run);
+    const lockedRefs = new Set(run.masterSnapshot.filter(card => card.userLocked).map(card => maps.idToRef.get(String(card.cardId))));
+    for (const ref of lockedRefs) if (classified.get(ref) !== 'keep') throw new Error(`잠금 카드는 KEEP으로만 판정할 수 있습니다: ${ref}`);
+    if (typeof audit.summary !== 'string' || !audit.summary.trim()) throw new Error('audit.summary가 비어 있습니다.');
+    if (!Number.isInteger(Number(audit.addCount)) || Number(audit.addCount) < 0) throw new Error('audit.addCount가 올바르지 않습니다.');
+    if (audit.result === 'FAIL') {
+      if (!cards.length) throw new Error('FAIL 수정 결과에는 최신 전체 cards 배열이 필요합니다.');
+      if (Number(audit.recommendedCount) !== cards.length) throw new Error(`recommendedCount 불일치: cards ${cards.length}개, 응답 ${audit.recommendedCount}`);
+      const originalById = new Map(run.masterSnapshot.map(card => [String(card.cardId), card]));
+      const outputById = new Map(cards.map(card => [String(card.cardId), card]));
+      const cardForRef = ref => outputById.get(maps.refToId.get(String(ref)));
+      for (const ref of audit.keep.map(String)) {
+        const original = originalById.get(maps.refToId.get(ref));
+        const output = cardForRef(ref);
+        if (!output || storyTimelineComparable(output) !== storyTimelineComparable(original)) throw new Error(`KEEP 카드가 누락되거나 변경되었습니다: ${ref}`);
+      }
+      for (const ref of audit.update.map(String)) {
+        const original = originalById.get(maps.refToId.get(ref));
+        const output = cardForRef(ref);
+        if (!output || storyTimelineComparable(output) === storyTimelineComparable(original)) throw new Error(`UPDATE 카드가 누락되었거나 실제 변경이 없습니다: ${ref}`);
+      }
+      for (const ref of audit.remove.map(String)) if (cardForRef(ref)) throw new Error(`REMOVE 카드가 최종 배열에 남아 있습니다: ${ref}`);
+      for (const ref of audit.split.map(String)) if (!cardForRef(ref)) throw new Error(`SPLIT 원본 REF가 최종 배열에 없습니다: ${ref}`);
+      for (const group of audit.merge) {
+        if (!cardForRef(group.targetRef)) throw new Error(`MERGE targetRef가 최종 배열에 없습니다: ${group.targetRef}`);
+        for (const ref of group.refs.map(String)) if (ref !== String(group.targetRef) && cardForRef(ref)) throw new Error(`MERGE로 흡수된 카드가 최종 배열에 남아 있습니다: ${ref}`);
+      }
+      const newCount = cards.filter(card => !originalById.has(String(card.cardId))).length;
+      const minimumNew = Number(audit.addCount) + audit.split.length;
+      if (newCount < minimumNew) throw new Error(`NEW 카드 수가 ADD·SPLIT 판정보다 적습니다: 최소 ${minimumNew}개, 결과 ${newCount}개`);
+    } else {
+      if (cards.length) throw new Error(`${audit.result} 결과에는 타임라인 변경 cards를 포함할 수 없습니다.`);
+    }
+    return { ...audit, currentCount:run.masterSnapshot.length, recommendedCount:audit.result === 'FAIL' ? cards.length : (audit.recommendedCount == null ? null : Number(audit.recommendedCount)), addCount:Number(audit.addCount) };
+  }
+
+  function parseStoryTimelineAuditJson(value, room, run, expectedScope) {
+    const parsed = typeof value === 'string' ? parseStoryTimelineJsonObject(value) : value;
+    if (!parsed.audit || !Array.isArray(parsed.cards)) throw new Error('audit와 cards가 포함된 점검 JSON schema가 필요합니다.');
+    const cards = parsed.audit.result === 'FAIL' ? materializeStoryTimelineJsonCards(parsed.cards, room, run, { workingCards:run.masterSnapshot }) : [];
+    const audit = validateStoryTimelineAudit(parsed.audit, cards, room, run, expectedScope);
+    return { audit, cards, preview:audit.result === 'FAIL' ? buildStoryTimelinePreview(cards, run) : null };
+  }
+
+  function buildStoryTimelineAuditManualPrompt(room, run, snapshot, sourceScope) {
+    const currentState = (room.slots || []).find(slot => slot.id === 'currentState');
+    const allLogs = parseDatedLogBlocks(String((room.slots || []).find(slot => slot.id === 'logSummary')?.content || ''))
+      .filter(block => blockBelongsToTimeline(block, run.timelineLabel)).map(block => block.raw).join('\n\n');
+    const evidence = sourceScope === 'TIMELINE_ONLY' ? '' : `\n[FULL_RP_EVIDENCE]\n${formatAiDialogueTurns(snapshot?.allTurns || [])}\n[/FULL_RP_EVIDENCE]\n[LATEST_CURRENT_STATE]\n${String(currentState?.content || '').trim()}\n[/LATEST_CURRENT_STATE]\n[DATE_LOGS]\n${allLogs}\n[/DATE_LOGS]`;
+    return `${String(effectiveTimelineGuide(room)).trim()}\n\n[RP_MANAGER_TIMELINE_AUDIT]\nMODE=점검\nSOURCE_SCOPE=${sourceScope}\nACTIVE_TIMELINE=${run.timelineLabel}\nCURRENT_COUNT=${run.masterSnapshot.length}\n[MASTER_TIMELINE]\n${serializeStoryTimelineRefMaster(run.masterSnapshot, run, true)}\n[/MASTER_TIMELINE]${evidence}\n\n실제 TL ID, USER_LOCKED, INJECT, VERSION, SOURCE_TIMELINE은 출력하지 않습니다. 모든 기존 REF를 판정하고, FAIL이면 수정된 최신 전체 타임라인을 이어서 출력합니다.\n[TIMELINE_AUDIT]\nRESULT=PASS | FAIL | UNVERIFIED\nSOURCE_SCOPE=${sourceScope}\nCURRENT_COUNT=${run.masterSnapshot.length}\nRECOMMENDED_COUNT=수정 적용 후 카드 수 또는 UNKNOWN\nKEEP=REF 목록 또는 NONE\nUPDATE=REF 목록 또는 NONE\nMERGE=C003+C004 또는 NONE\nREMOVE=REF 목록 또는 NONE\nSPLIT=REF 목록 또는 NONE\nADD=추가 카드 수 또는 NONE\nLOCKED_ISSUES=잠금 카드 문제 또는 NONE\nSUMMARY=짧고 구체적인 판정 근거\n[/TIMELINE_AUDIT]\n\nFAIL일 때만:\n[TIMELINE]\n[CARD]\nREF=C001 또는 NEW\nDATE_START=YYYY.MM.DD 또는 UNKNOWN\nDATE_END=YYYY.MM.DD 또는 UNKNOWN\nTITLE=제목\nTAGS=키워드1,키워드2\nCONTENT=\n본문\n[/CARD]\n[/TIMELINE]\n[/RP_MANAGER_TIMELINE_AUDIT]`;
+  }
+
+  function buildStoryTimelineAuditApiPrompt(room, run, snapshot, sourceScope, candidateCards = null) {
+    const manual = buildStoryTimelineAuditManualPrompt(room, run, snapshot, sourceScope);
+    const candidate = candidateCards ? `\n[INDEPENDENT_STORY_SPINE_CANDIDATE]\n${serializeStoryTimelineRefMaster(candidateCards, run, true, true)}\n[/INDEPENDENT_STORY_SPINE_CANDIDATE]\n원본 master와 독립 후보를 전체 비교해 카드별 판정과 최종 결과를 작성한다. 독립 후보의 REF=NEW는 원본 master에 없던 카드이므로 최종 결과에서도 NEW로 출력한다.` : '';
+    return `${manual}\n${candidate}\n[FIXED_JSON_OUTPUT]\n수동 출력 블록 대신 지정된 점검 JSON schema 하나만 출력한다. FAIL이면 cards에 수정된 최신 전체 타임라인을 넣고, PASS/UNVERIFIED이면 cards를 비운다.\n[/FIXED_JSON_OUTPUT]`;
+  }
+
+  function storyTimelineAuditEstimate(room, snapshot, requestedScope = 'FULL') {
+    const sourceScope = requestedScope === 'TIMELINE_ONLY' ? 'TIMELINE_ONLY' : (snapshot?.historyLimitReached ? 'PARTIAL' : 'FULL');
+    const run = createStoryTimelineRun(room, activeLogTimelineLabel(room), 'audit', sourceScope);
+    const prompt = buildStoryTimelineAuditApiPrompt(room, run, snapshot, sourceScope);
+    const inputTokens = Math.ceil((String(room.storyTimelineGuide || '').length + prompt.length) / 2);
+    const outputTokens = Math.max(2200, Math.ceil(serializeStoryTimelineRefMaster(run.masterSnapshot, run, false).length / 2));
+    const settings = aiFeatureSettings(loadAiSummarySettings(), 'timeline');
+    const model = settings.models?.[settings.provider] || '';
+    return { sourceScope, inputTokens, outputTokens, estimatedCostUsd:estimateAiCostUsd({ inputTokens, outputTokens }, getAiPricing(settings, settings.provider, model)), chars:prompt.length };
+  }
+
+  function addStoryTimelineAuditHistory(room, draft) {
+    const entry = { id:String(draft.id || ''), createdAt:String(draft.createdAt || nowIso()), timelineLabel:String(draft.run?.timelineLabel || activeLogTimelineLabel(room)), result:String(draft.audit?.result || 'UNVERIFIED'), sourceScope:String(draft.audit?.sourceScope || draft.run?.sourceScope || 'TIMELINE_ONLY'), currentCount:Number(draft.audit?.currentCount ?? draft.run?.masterSnapshot?.length ?? 0), recommendedCount:draft.audit?.recommendedCount == null ? null : Number(draft.audit.recommendedCount), provider:String(draft.provider || ''), model:String(draft.model || ''), usage:{ ...(draft.usage || {}) }, summary:String(draft.audit?.summary || '') };
+    const sameTimeline = [entry, ...(room.storyTimelineAuditHistory || []).filter(item => String(item.id) !== entry.id && normalizedLogTimelineKey(item.timelineLabel) === normalizedLogTimelineKey(entry.timelineLabel))].slice(0, 5);
+    const otherTimelines = (room.storyTimelineAuditHistory || []).filter(item => String(item.id) !== entry.id && normalizedLogTimelineKey(item.timelineLabel) !== normalizedLogTimelineKey(entry.timelineLabel));
+    room.storyTimelineAuditHistory = [...sameTimeline, ...otherTimelines].sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || ''))).slice(0, 50);
+    return entry;
+  }
+
+  async function generateStoryTimelineAuditDraft(room, settings, secret, snapshot, requestedScope = 'FULL', onStatus = () => {}) {
+    const sourceScope = requestedScope === 'TIMELINE_ONLY' ? 'TIMELINE_ONLY' : (snapshot?.historyLimitReached ? 'PARTIAL' : 'FULL');
+    const run = createStoryTimelineRun(room, activeLogTimelineLabel(room), 'audit', sourceScope);
+    settings.__timelineRoom = room;
+    const provider = settings.provider;
+    const systemInstruction = String(effectiveTimelineGuide(room)).trim();
+    const usage = { calls:0, inputTokens:0, outputTokens:0, estimatedCostUsd:0 };
+    let candidateCards = null;
+    const chunks = sourceScope === 'TIMELINE_ONLY' ? [] : splitStoryTimelineTurns(snapshot?.allTurns || []);
+    if (chunks.length > 1) {
+      candidateCards = [];
+      for (let index = 0; index < chunks.length; index++) {
+        onStatus(`독립 Story Spine 후보 구성 중 · ${index + 1}/${chunks.length}묶음`);
+        const prompt = `[AUDIT_CANDIDATE_BUILD]\n원래 타임라인을 문장만 다듬지 말고, 제공된 원문으로 이상적인 최소 Story Spine 후보를 독립적으로 누적 구축한다.\n[ORIGINAL_REFERENCE]\n${serializeStoryTimelineRefMaster(run.masterSnapshot, run, true)}\n[/ORIGINAL_REFERENCE]\n[WORKING_CANDIDATE]\n${serializeStoryTimelineRefMaster(candidateCards, run, false)}\n[/WORKING_CANDIDATE]\n[TARGET_RP]\n${formatAiDialogueTurns(chunks[index])}\n[/TARGET_RP]\n지정 JSON schema만 출력한다. 후보가 바뀌면 CHANGED와 전체 후보 배열, 아니면 NO_CHANGE와 빈 배열을 쓴다.`;
+        const validRefs = run.refEntries.map(item => item.ref);
+        const response = await callStoryTimelineStructured(provider, settings, secret, systemInstruction, prompt, storyTimelineUpdateResponseSchema(validRefs), raw => parseStoryTimelineUpdateJson(raw, room, run, { workingCards:candidateCards }), usage, onStatus);
+        if (response.parsed.status === 'CHANGED') candidateCards = response.parsed.cards;
+      }
+    }
+    onStatus('실행 전 master와 독립 후보를 전체 비교해 점검 중…');
+    const finalSnapshot = candidateCards ? { ...snapshot, allTurns:[] } : snapshot;
+    const prompt = buildStoryTimelineAuditApiPrompt(room, run, finalSnapshot, sourceScope, candidateCards);
+    const validRefs = run.refEntries.slice(0, run.masterSnapshot.length).map(item => item.ref);
+    const response = await callStoryTimelineStructured(provider, settings, secret, systemInstruction, prompt, storyTimelineAuditResponseSchema(validRefs), raw => parseStoryTimelineAuditJson(raw, room, run, sourceScope), usage, onStatus);
+    assertStoryTimelineRunCurrent(room, run);
+    const result = response.parsed;
+    const draft = { id:run.runId, createdAt:nowIso(), provider, model:String(settings.models?.[provider] || ''), run, audit:result.audit, preview:result.preview, usage, rawResult:response.raw, formatRetried:response.formatRetried };
+    addStoryTimelineAuditHistory(room, draft);
+    return draft;
+  }
+
+  function parseStoryTimelineAuditManual(value, room, run, expectedScope) {
+    const src = normalizeLineBreaks(String(value || '')).trim();
+    const match = src.match(/\[TIMELINE_AUDIT\]([\s\S]*?)\[\/TIMELINE_AUDIT\]/i);
+    if (!match) throw new Error('[TIMELINE_AUDIT] 점검 결과 구획을 찾지 못했습니다.');
+    const body = match[1];
+    const field = key => String(body.match(new RegExp(`^${key}[ \\t]*=[ \\t]*(.*)$`, 'im'))?.[1] || '').trim();
+    const refs = value => /^(?:NONE|없음)$/i.test(value) || !value ? [] : value.split(/[,，]/).map(item => item.trim()).filter(Boolean);
+    const merge = refs(field('MERGE')).map(group => {
+      const items = group.split('+').map(item => item.trim()).filter(Boolean);
+      return { refs:items, targetRef:items[0] || '' };
+    });
+    const recommendedRaw = field('RECOMMENDED_COUNT');
+    const addRaw = field('ADD');
+    const audit = {
+      result:field('RESULT').toUpperCase(), sourceScope:field('SOURCE_SCOPE').toUpperCase(), currentCount:Number(field('CURRENT_COUNT')),
+      recommendedCount:/^(?:UNKNOWN|미상)$/i.test(recommendedRaw) ? null : Number(recommendedRaw),
+      keep:refs(field('KEEP')), update:refs(field('UPDATE')), merge, remove:refs(field('REMOVE')), split:refs(field('SPLIT')),
+      addCount:/^(?:NONE|없음)$/i.test(addRaw) || !addRaw ? 0 : Number(addRaw),
+      lockedIssues:refs(field('LOCKED_ISSUES')), summary:field('SUMMARY'),
+    };
+    let preview = null;
+    let cards = [];
+    if (audit.result === 'FAIL') {
+      preview = parseStoryTimelineImport(src, room, { run });
+      cards = preview.cards;
+    }
+    const normalizedAudit = validateStoryTimelineAudit(audit, cards, room, run, expectedScope);
+    return { audit:normalizedAudit, cards, preview };
+  }
+
+  function applyStoryTimelinePreviewForRun(room, run, preview) {
+    assertStoryTimelineRunCurrent(room, run);
+    const key = normalizedLogTimelineKey(run.timelineLabel === DEFAULT_LOG_TIMELINE ? '' : run.timelineLabel);
+    const otherCards = normalizeStoryTimelineCards(room).filter(card => normalizedLogTimelineKey((card.timelineLabel || DEFAULT_LOG_TIMELINE) === DEFAULT_LOG_TIMELINE ? '' : card.timelineLabel) !== key);
+    const originalById = new Map((run.masterSnapshot || []).map(card => [String(card.cardId), card]));
+    const safeCards = (preview.cards || []).map((card, index) => {
+      const original = originalById.get(String(card.cardId));
+      if (original?.userLocked) return { ...original, sortOrder:index, tags:[...(original.tags || [])] };
+      return { ...card, timelineLabel:run.timelineLabel, userLocked:!!original?.userLocked, inject:original ? original.inject !== false : true, sortOrder:index, tags:[...(card.tags || [])] };
+    });
+    for (const locked of (run.masterSnapshot || []).filter(card => card.userLocked && !safeCards.some(next => String(next.cardId) === String(card.cardId)))) safeCards.push({ ...locked, sortOrder:safeCards.length, tags:[...(locked.tags || [])] });
+    room.storyTimelineCards = [...otherCards, ...safeCards];
+    normalizeStoryTimelineCards(room);
+    return safeCards;
+  }
+
+  function markStoryReviewCompleted(room) {
+    const pending = room.storyTimelinePendingReview;
+    if (!pending) return 0;
+    const reviewMap = new Map((pending.logs || []).map(item => [String(item.logId), Number(item.version || 0)]));
+    let count = 0;
+    for (const meta of (room.storyLogReviews || [])) {
+      const reviewed = reviewMap.get(String(meta.logId));
+      if (reviewed != null) { meta.reviewedVersion = Math.max(Number(meta.reviewedVersion || 0), reviewed); count++; }
+    }
+    room.storyTimelineLastReviewedMessageId = String(pending.endMessageId || room.storyTimelineLastReviewedMessageId || '');
+    room.storyTimelineLastReviewedAt = nowIso();
+    room.storyTimelinePendingReview = null;
+    storyReviewSnapshotCache.delete(String(room.chatId));setTimeout(()=>{if(state.currentRoom===room)scheduleStoryReviewCountRefresh(room);},0);
+    return count;
+  }
+
+  function markStoryLogsReviewed(room) {
+    return markStoryReviewCompleted(room);
+  }
+
+  function blockBelongsToTimeline(block, label) {
+    const blockKey = normalizedLogTimelineKey(logTimelineLabelOfBlock(block) === DEFAULT_LOG_TIMELINE ? '' : logTimelineLabelOfBlock(block));
+    const timelineKey = normalizedLogTimelineKey(label === DEFAULT_LOG_TIMELINE ? '' : label);
+    return blockKey === timelineKey;
+  }
+
+  function parseDatedLogBlocks(text) {
+    const src = normalizeLineBreaks(text);
+    // 기본 양력형 외에 작품 고유 표기인 BC206·기원전 206년·AD714도 날짜 블록으로 인식합니다.
+    // 제목 전체를 먼저 읽고 날짜 부분만 검증해, 일반 [소제목]은 날짜로 잘못 잡지 않습니다.
+    const re = /^[ \t]*\[([^\]\n]+)\][ \t]*$/gm;
+    const hits = [];
+    let m;
+    while ((m = re.exec(src))) {
+      const inner = String(m[1] || '').trim();
+      const standard = inner.match(/^((?:(\d{1,6})년[ \t]*)?(\d{1,2})월[ \t]*(\d{1,2})일)(?:[ \t]*·[ \t]*([^\-–—|｜]+?))?(?:[ \t]*[-–—|｜][ \t]*(.+))?$/);
+      const unknown = inner.match(/^(날짜[ \t]*(미상|미정|불명|없음))(?:[ \t]*·[ \t]*([^\-–—|｜]+?))?(?:[ \t]*[-–—|｜][ \t]*(.+))?$/);
+      const eraNamePattern = 'B\\.?[ \\t]*C\\.?(?:[ \\t]*E\\.?)?|A\\.?[ \\t]*D\\.?|C\\.?[ \\t]*E\\.?|기원전|서기';
+      const eraRe = new RegExp(`^((${eraNamePattern})[ \\t]*(\\d{1,6})(?:년)?(?:[ \\t]*(\\d{1,2})월[ \\t]*(\\d{1,2})일)?(?:[ \\t]*[~～](?:[ \\t]*(?:${eraNamePattern}[ \\t]*)?\\d{1,6}(?:년)?(?:[ \\t]*\\d{1,2}월[ \\t]*\\d{1,2}일)?)?)?)(?:[ \\t]*·[ \\t]*([^\\-–—|｜]+?))?(?:[ \\t]*[-–—|｜][ \\t]*(.+))?$`, 'i');
+      const era = inner.match(eraRe);
+      if (!standard && !unknown && !era) continue;
+
+      const isUnknown = !!unknown;
+      const isSpecialDate = !!era;
+      let fullDate = '';
+      let year = null;
+      let month = null;
+      let day = null;
+      let sortYear = null;
+      let unknownLabel = '';
+      let timelineLabel = '';
+      let sourceTimelineLabel = '';
+      let events = '';
+      if (standard) {
+        fullDate = standard[1];
+        year = standard[2] ? Number(standard[2]) : null;
+        month = Number(standard[3]);
+        day = Number(standard[4]);
+        sortYear = year;
+        sourceTimelineLabel = sanitizeLogTimelineLabel(standard[5]);
+        timelineLabel = cleanLogTimelineLabel(sourceTimelineLabel);
+        events = String(standard[6] || '').trim();
+      } else if (unknown) {
+        fullDate = `날짜 ${unknown[2]}`;
+        unknownLabel = fullDate;
+        sourceTimelineLabel = sanitizeLogTimelineLabel(unknown[3]);
+        timelineLabel = cleanLogTimelineLabel(sourceTimelineLabel);
+        events = String(unknown[4] || '').trim();
+      } else {
+        fullDate = String(era[1] || '').trim();
+        const eraName = String(era[2] || '').replace(/[.\s]/g, '').toUpperCase();
+        const eraYear = Number(era[3]);
+        const isBeforeCommonEra = eraName === 'BC' || eraName === 'BCE' || eraName === '기원전';
+        sortYear = isBeforeCommonEra ? -eraYear : eraYear;
+        month = era[4] ? Number(era[4]) : null;
+        day = era[5] ? Number(era[5]) : null;
+        sourceTimelineLabel = sanitizeLogTimelineLabel(era[6]);
+        timelineLabel = cleanLogTimelineLabel(sourceTimelineLabel);
+        events = String(era[7] || '').trim();
+      }
+      hits.push({
+        index: m.index,
+        endTitle: re.lastIndex,
+        headingEnd: re.lastIndex,
+        fullDate,
+        year,
+        sortYear,
+        month,
+        day,
+        unknownLabel,
+        timelineLabel,
+        sourceTimelineLabel,
+        isUnknown,
+        isSpecialDate,
+        events,
+        heading: m[0].trim(),
+        headingRaw: m[0],
+      });
+    }
+    if (!hits.length) return [];
+    return hits.map((h, i) => {
+      const end = i + 1 < hits.length ? hits[i + 1].index : src.length;
+      const body = src.slice(h.endTitle, end).trim();
+      const raw = `${h.heading}${body ? `\n${body}` : ''}`;
+      const calendarDateKey = h.isUnknown
+        ? `unknown-${i}-${simpleHash(h.heading)}`
+        : h.isSpecialDate
+          ? `era-${String(h.fullDate || '').toLowerCase().replace(/\s+/g, '')}`
+          : `${h.year || 'x'}-${String(h.month).padStart(2,'0')}-${String(h.day).padStart(2,'0')}`;
+      const timelineKey = normalizedLogTimelineKey(h.timelineLabel);
+      const dateKey = h.isUnknown ? calendarDateKey : `${calendarDateKey}::${timelineKey}`;
+      const key = `${dateKey}-${simpleHash(h.heading)}`;
+      const yearPrefix = h.year ? `${h.year}.` : '';
+      return {
+        ...h,
+        key,
+        dateKey,
+        calendarDateKey,
+        timelineKey,
+        raw,
+        body,
+        index: i,
+        weekOfMonth: h.isUnknown || !h.day ? null : Math.min(5, Math.floor((h.day - 1) / 7) + 1),
+        titleText: h.isUnknown
+          ? `${h.unknownLabel}${h.events ? ` ${h.events}` : ''}`
+          : h.isSpecialDate
+            ? `${h.fullDate}${h.timelineLabel && h.timelineLabel !== DEFAULT_LOG_TIMELINE ? ` · ${h.timelineLabel}` : ''}${h.events ? ` ${h.events}` : ''}`
+            : `${yearPrefix}${h.month}/${h.day}${h.timelineLabel && h.timelineLabel !== DEFAULT_LOG_TIMELINE ? ` · ${h.timelineLabel}` : ''}${h.events ? ` ${h.events}` : ''}`,
+        sourceStart: h.index,
+        sourceEnd: end,
+      };
+    });
+  }
+
+  const CURRENT_STATE_SECTION_RULE = '━━━━━━━━━━━━━━━━━━━━';
+
+  function parseCurrentStateSections(text) {
+    const src = normalizeLineBreaks(String(text || '')).trim();
+    if (!src) return [];
+    const lines = src.split('\n');
+    const sections = [];
+    let i = 0;
+    while (i < lines.length) {
+      while (i < lines.length && !String(lines[i] || '').trim()) i++;
+      if (i >= lines.length) break;
+      const titleLine = lines[i + 1] || '';
+      const titleMatch = titleLine.match(/^(\d+)\.\s+(.+?)\s*$/);
+      if (lines[i] !== CURRENT_STATE_SECTION_RULE || !titleMatch || lines[i + 2] !== CURRENT_STATE_SECTION_RULE) return [];
+      const bodyStartLine = i + 3;
+      let j = bodyStartLine;
+      while (j < lines.length) {
+        const nextTitle = lines[j + 1] || '';
+        if (lines[j] === CURRENT_STATE_SECTION_RULE && /^(\d+)\.\s+(.+?)\s*$/.test(nextTitle) && lines[j + 2] === CURRENT_STATE_SECTION_RULE) break;
+        j++;
+      }
+      const body = lines.slice(bodyStartLine, j).join('\n').trim();
+      sections.push({
+        number: Number(titleMatch[1]),
+        title: String(titleMatch[2] || '').trim(),
+        body,
+        index: sections.length,
+      });
+      i = j;
+    }
+    return sections;
+  }
+
+  function parseCurrentStateSubblocks(body) {
+    const src = normalizeLineBreaks(String(body || '')).trim();
+    if (!src) return { intro:'', blocks:[] };
+    const lines = src.split('\n');
+    const hits = [];
+    for (let i = 0; i < lines.length; i++) {
+      const m = String(lines[i] || '').match(/^\[([^\[\]\n]+)\]$/);
+      if (m) hits.push({ line:i, title:String(m[1] || '').trim() });
+    }
+    if (!hits.length) return { intro:src, blocks:[] };
+    const intro = lines.slice(0, hits[0].line).join('\n').trim();
+    const blocks = hits.map((hit, idx) => {
+      const end = idx + 1 < hits.length ? hits[idx + 1].line : lines.length;
+      return { title:hit.title, body:lines.slice(hit.line + 1, end).join('\n').trim(), index:idx };
+    });
+    return { intro, blocks };
+  }
+
+  function buildCurrentStateText(sections) {
+    return (sections || []).map((section, index) => {
+      const title = String(section?.title || `섹션 ${index + 1}`).trim();
+      const body = String(section?.body || '').trim();
+      return `${CURRENT_STATE_SECTION_RULE}\n${index + 1}. ${title}\n${CURRENT_STATE_SECTION_RULE}${body ? `\n${body}` : ''}`;
+    }).join('\n\n').trim();
+  }
+
+  function buildCurrentStateSubblockBody(model) {
+    const parts = [];
+    const intro = String(model?.intro || '').trim();
+    if (intro) parts.push(intro);
+    for (const block of (model?.blocks || [])) {
+      const title = String(block?.title || '').trim();
+      const body = String(block?.body || '').trim();
+      if (!title) continue;
+      parts.push(`[${title}]${body ? `\n${body}` : ''}`);
+    }
+    return parts.join('\n\n').trim();
+  }
+
+  // 최신 로그는 저장소에서 뒤에 붙은 순서가 아니라 확정된 실제 날짜를 우선해 고릅니다.
+  // 연도가 없는 [M월 D일-...] 블록은 연도를 추측하지 않습니다.
+  // 연도 없는 블록만 있는 경우에는 기존 저장소 순서를 유지하고,
+  // 연도가 확정된 로그 뒤에 연도 없는 블록이 새로 붙은 경우에만 그 뒤쪽 블록을 안전한 후보로 봅니다.
+  function selectRecentLogBlocks(blocks, count) {
+    const n = Math.max(0, Number(count) || 0);
+    if (!n) return [];
+    const dated = (blocks || []).filter(b => b && !b.isUnknown);
+    if (!dated.length) return [];
+
+    // BC가 기원전이 아니라 작품 고유 시대 코드일 수도 있으므로 숫자의 증감 방향을 임의 해석하지 않습니다.
+    // 특수 연호가 섞인 저장소에서는 사용자가 정리해 둔 블록 순서를 최신 기준으로 사용합니다.
+    if (dated.some(b => b.isSpecialDate)) return dated.slice(-n);
+
+    const withYear = dated.filter(b => Number.isInteger(b.sortYear));
+    if (!withYear.length) return dated.slice(-n);
+
+    const knownSorted = [...withYear].sort((a, b) =>
+      Number(a.sortYear) - Number(b.sortYear) ||
+      Number(a.month || 0) - Number(b.month || 0) ||
+      Number(a.day || 0) - Number(b.day || 0) ||
+      Number(a.index) - Number(b.index)
+    );
+    const latestKnown = knownSorted[knownSorted.length - 1];
+
+    // 연도 없는 로그가 '실제 날짜 기준 최신 로그'보다 저장소 뒤쪽에 새로 붙어 있다면
+    // 연도를 임의 추정하지 않고 그 뒤쪽 순서를 보조 안전장치로 사용합니다.
+    const trailingNoYear = dated.filter(b => b.sortYear == null && Number(b.index) > Number(latestKnown.index));
+    if (!trailingNoYear.length) return knownSorted.slice(-n);
+
+    const unknownTail = trailingNoYear.slice(-n);
+    const remaining = Math.max(0, n - unknownTail.length);
+    return [...(remaining ? knownSorted.slice(-remaining) : []), ...unknownTail];
+  }
+
+  // Keep the two latest eligible blocks on the active timeline, independent of relevance.
+  function recentContinuityLogBlocks(room, blocks, excludedKeys = new Set()) {
+    const active = normalizedLogTimelineKey(activeLogTimelineLabel(room));
+    const eligible = (blocks || []).filter(block => {
+      if (!block?.key || !String(block.raw || '').trim() || block.isUnknown || excludedKeys.has(String(block.key))) return false;
+      if (normalizedLogTimelineKey(logTimelineLabelOfBlock(block)) !== active) return false;
+      if (block.month != null && (!Number.isInteger(Number(block.month)) || Number(block.month) < 1 || Number(block.month) > 12)) return false;
+      if (block.day != null && (!Number.isInteger(Number(block.day)) || Number(block.day) < 1 || Number(block.day) > 31)) return false;
+      return true;
+    });
+    return selectRecentLogBlocks(eligible, recentLogInjectionCount(room)).reverse();
+  }
+
+  function logTimelineLabelsVisibleFromActive(room) {
+    const labels = normalizeRoomLogTimelines(room).slice();
+    const active = activeLogTimelineLabel(room);
+    const activeIndex = labels.findIndex(label => normalizedLogTimelineKey(label) === normalizedLogTimelineKey(active));
+    return activeIndex < 0 ? [DEFAULT_LOG_TIMELINE] : labels.slice(0, activeIndex + 1);
+  }
+
+  function autoRecallVisibleLogBlocks(blocks, room) {
+    const visible = new Set(logTimelineLabelsVisibleFromActive(room).map(label => normalizedLogTimelineKey(label)));
+    return (blocks || []).filter(block => visible.has(normalizedLogTimelineKey(logTimelineLabelOfBlock(block))));
+  }
+
+  // 날짜 정렬과 과거 시간선 탐색에 쓰이는 호환 helper입니다.
+  // 자동 회수는 이제 최근 N개를 강제 포함하지 않고 관련도 판정을 먼저 거칩니다.
+  function selectTimelineAwareRecentLogBlocks(blocks, room, count) {
+    const limit = Math.max(0, Number(count) || 0);
+    if (!limit) return [];
+    const active = activeLogTimelineLabel(room);
+    const visibleLabels = logTimelineLabelsVisibleFromActive(room);
+    const activeRecent = selectRecentLogBlocks((blocks || []).filter(block => blockBelongsToTimeline(block, active)), limit);
+    const selected = activeRecent.length ? [activeRecent[activeRecent.length - 1]] : [];
+    const selectedKeys = new Set(selected.map(block => String(block.key)));
+    for (const label of [...visibleLabels].reverse()) {
+      if (selected.length >= limit) break;
+      if (normalizedLogTimelineKey(label) === normalizedLogTimelineKey(active)) continue;
+      const previousLatest = selectRecentLogBlocks((blocks || []).filter(block => blockBelongsToTimeline(block, label)), 1)[0];
+      if (previousLatest && !selectedKeys.has(String(previousLatest.key))) {
+        selected.push(previousLatest);
+        selectedKeys.add(String(previousLatest.key));
+      }
+    }
+    for (let index = activeRecent.length - 2; index >= 0 && selected.length < limit; index--) {
+      const block = activeRecent[index];
+      if (!selectedKeys.has(String(block.key))) {
+        selected.push(block);
+        selectedKeys.add(String(block.key));
+      }
+    }
+    return selected.slice(0, limit);
+  }
+
+  function formatNormalizedLogHeading(block, year = null, month = null, day = null, timelineLabel = block?.timelineLabel || '') {
+    const timeline = cleanLogTimelineLabel(timelineLabel);
+    const timelineSuffix = timeline && timeline !== DEFAULT_LOG_TIMELINE ? `·${timeline}` : '';
+    const suffix = block.events ? `-${block.events}` : '';
+    if (year && month && day) return `[${Number(year)}년 ${Number(month)}월 ${Number(day)}일${timelineSuffix}${suffix}]`;
+    if (!block.isUnknown && month && day) return `[${Number(month)}월 ${Number(day)}일${timelineSuffix}${suffix}]`;
+    return `[${block.unknownLabel || '날짜 미상'}${timelineSuffix}${suffix}]`;
+  }
+
+  function formatLogHeadingForTimeline(block, timelineLabel) {
+    const timeline = cleanLogTimelineLabel(timelineLabel);
+    const storedTimeline = timeline && timeline !== DEFAULT_LOG_TIMELINE ? timeline : '';
+    if (block.isSpecialDate) {
+      return `[${block.fullDate}${storedTimeline ? `·${storedTimeline}` : ''}${block.events ? `-${block.events}` : ''}]`;
+    }
+    return formatNormalizedLogHeading(block, block.year, block.month, block.day, storedTimeline);
+  }
+
+  function compareLogBlocksChronologically(a, b) {
+    // 사용자가 날짜 미상으로 확정해 둔 사건은 시간상 가장 오래된 보관 구역에 둡니다.
+    // 실제 날짜를 창작하지 않으며, 미상 블록끼리는 원문 순서를 유지합니다.
+    const rank = block => block?.isUnknown ? 0 : Number.isInteger(block?.sortYear) ? 1 : 2;
+    const rankDiff = rank(a) - rank(b);
+    if (rankDiff) return rankDiff;
+    if (rank(a) === 1) {
+      const yearDiff = Number(a.sortYear) - Number(b.sortYear);
+      if (yearDiff) return yearDiff;
+    }
+    if (rank(a) > 0) {
+      const monthDiff = Number(a.month || 0) - Number(b.month || 0);
+      if (monthDiff) return monthDiff;
+      const dayDiff = Number(a.day || 0) - Number(b.day || 0);
+      if (dayDiff) return dayDiff;
+    }
+    return Number(a.index || 0) - Number(b.index || 0);
+  }
+
+  function sortDatedLogTextByTimeline(value, room) {
+    const text = normalizeLineBreaks(String(value || '')).trim();
+    const blocks = parseDatedLogBlocks(text);
+    if (!blocks.length) return text;
+    const prefix = text.slice(0, blocks[0].sourceStart).trim();
+    const labels = normalizeRoomLogTimelines(room).slice();
+    blocks.forEach(block => {
+      const label = logTimelineLabelOfBlock(block);
+      if (!labels.some(item => normalizedLogTimelineKey(item) === normalizedLogTimelineKey(label))) labels.push(label);
+    });
+    const ordered = labels.flatMap(label => blocks
+      .filter(block => blockBelongsToTimeline(block, label))
+      .sort(compareLogBlocksChronologically));
+    return [prefix, ...ordered.map(block => String(block.raw || '').trim())].filter(Boolean).join('\n\n').trim();
+  }
+
+  // 활성 시간선은 API 결과뿐 아니라 로그요약 칸에 새로 붙이거나 추가한
+  // 무표식 날짜 블록의 저장 위치도 정합니다. 기존 기본 시간선 블록은 그대로 둡니다.
+  function alignNewManualLogBlocksToActiveTimeline(previousValue, nextValue, room) {
+    const previousText = normalizeLineBreaks(String(previousValue || '')).trim();
+    let nextText = normalizeLineBreaks(String(nextValue || '')).trim();
+    const active = activeLogTimelineLabel(room);
+    const nextBlocks = parseDatedLogBlocks(nextText);
+    if (!nextBlocks.length || active === DEFAULT_LOG_TIMELINE) return sortDatedLogTextByTimeline(nextText, room);
+    const oldCounts = new Map();
+    parseDatedLogBlocks(previousText).forEach(block => {
+      const signature = `${block.heading}\n${block.body}`;
+      oldCounts.set(signature, (oldCounts.get(signature) || 0) + 1);
+    });
+    const replacements = [];
+    nextBlocks.forEach(block => {
+      const signature = `${block.heading}\n${block.body}`;
+      const oldCount = oldCounts.get(signature) || 0;
+      if (oldCount > 0) {
+        oldCounts.set(signature, oldCount - 1);
+        return;
+      }
+      if (logTimelineLabelOfBlock(block) !== DEFAULT_LOG_TIMELINE) return;
+      replacements.push({ start:block.sourceStart, end:block.headingEnd, text:formatLogHeadingForTimeline(block, active) });
+    });
+    replacements.sort((a, b) => b.start - a.start).forEach(replacement => {
+      nextText = nextText.slice(0, replacement.start) + replacement.text + nextText.slice(replacement.end);
+    });
+    return sortDatedLogTextByTimeline(nextText, room);
+  }
+
+  function alignGeneratedLogTimeline(room, value) {
+    const text = stripAiOutputWrapper(value);
+    const blocks = parseDatedLogBlocks(text);
+    if (!blocks.length) return text;
+    const active = activeLogTimelineLabel(room);
+    const replacements = blocks.map(block => ({
+      start:block.sourceStart,
+      end:block.headingEnd,
+      text:formatLogHeadingForTimeline(block, active),
+    })).sort((a,b) => b.start - a.start);
+    let next = text;
+    replacements.forEach(replacement => {
+      next = next.slice(0, replacement.start) + replacement.text + next.slice(replacement.end);
+    });
+    return next;
+  }
+
+  function remapLogSelectionKeys(room, byOldKey, newBlocks) {
+    const valid = new Set(newBlocks.map(b => String(b.key)));
+    const remap = arr => [...new Set((arr || []).map(String).map(k => byOldKey.get(k) || k).filter(k => valid.has(k)))];
+    room.autoLogPinnedKeys = remap(room.autoLogPinnedKeys);
+    room.autoLogExcludedKeys = remap(room.autoLogExcludedKeys);
+    room.manualLogSelectedKeys = remap(room.manualLogSelectedKeys);
+    room.favoriteLogKeys = remap(room.favoriteLogKeys);
+    room.acceptedUnknownLogKeys = remap(room.acceptedUnknownLogKeys);
+
+    const nextByKey = new Map(newBlocks.map(block => [String(block.key), block]));
+
+    // 제목의 키워드가 바뀌면 로그 key도 달라집니다. 현재 주입 항목과 간편 패널에서
+    // 잠시 꺼둔 항목까지 같은 새 key·제목·본문으로 옮겨 선택 상태가 풀리지 않게 합니다.
+    const remapPendingItem = item => {
+      const oldKey = String(item?.sourceKey || item?.slotId || '').replace(/^auto-log:/, '');
+      const nextBlock = nextByKey.get(String(byOldKey.get(oldKey) || oldKey));
+      if (!nextBlock) {
+        const isLogItem = String(item?.slotId || '').startsWith('auto-log:') || String(item?.autoType || '').endsWith('-log');
+        return isLogItem ? null : item;
+      }
+      const prefix = item.autoType === 'pinned-log' ? '고정로그'
+        : item.autoType === 'manual-log' ? '직접로그'
+        : item.autoType === 'recent-log' ? '최근 연속성'
+        : item.autoType === 'related-log' ? '관련로그'
+        : '로그요약';
+      return {
+        ...item,
+        slotId:`auto-log:${nextBlock.key}`,
+        sourceKey:nextBlock.key,
+        title:`${prefix} [${logTimelineLabelOfBlock(nextBlock)}] ${nextBlock.titleText}`,
+        content:nextBlock.raw,
+        logIndex:nextBlock.index,
+      };
+    };
+    if (room.pending) {
+      room.pending.items = (room.pending.items || []).map(remapPendingItem).filter(Boolean);
+      room.pending.quickRemovedItems = (room.pending.quickRemovedItems || []).map(remapPendingItem).filter(Boolean);
+    }
+  }
+
+  function remapLogSelectionKeysByIndex(room, oldBlocks, newBlocks) {
+    const byOldKey = new Map();
+    oldBlocks.forEach((b, i) => {
+      if (newBlocks[i]) byOldKey.set(String(b.key), String(newBlocks[i].key));
+    });
+    remapLogSelectionKeys(room, byOldKey, newBlocks);
+  }
+
+  function duplicateLogDateGroups(room) {
+    const log = (room?.slots || []).find(s => s.id === 'logSummary');
+    const blocks = parseDatedLogBlocks(log?.content || '');
+    const byDate = new Map();
+    for (const block of blocks) {
+      if (block.isUnknown) continue;
+      if (!byDate.has(block.dateKey)) byDate.set(block.dateKey, []);
+      byDate.get(block.dateKey).push(block);
+    }
+    return [...byDate.entries()]
+      .filter(([, arr]) => arr.length > 1)
+      .map(([dateKey, arr]) => ({ dateKey, label: `${arr[0]?.fullDate || dateKey.replace(/^x-/, '').split('::')[0]} · ${logTimelineLabelOfBlock(arr[0])}`, blocks: arr }));
+  }
+
+  function pruneLogSelectionKeys(room, blocks = null) {
+    const log = (room?.slots || []).find(s => s.id === 'logSummary');
+    const validBlocks = blocks || parseDatedLogBlocks(log?.content || '');
+    const valid = new Set(validBlocks.map(b => String(b.key)));
+    room.autoLogPinnedKeys = (room.autoLogPinnedKeys || []).map(String).filter(k => valid.has(k));
+    room.autoLogExcludedKeys = (room.autoLogExcludedKeys || []).map(String).filter(k => valid.has(k));
+    room.manualLogSelectedKeys = (room.manualLogSelectedKeys || []).map(String).filter(k => valid.has(k));
+    room.favoriteLogKeys = (room.favoriteLogKeys || []).map(String).filter(k => valid.has(k));
+    room.acceptedUnknownLogKeys = (room.acceptedUnknownLogKeys || []).map(String).filter(k => valid.has(k));
+  }
+
+  // 기본 관련로그 검색은 로컬 키워드 점수화이며, 사용자가 옵션을 켠 경우에만
+  // 이 후보군을 저장된 API가 현재 RP 맥락으로 한 번 더 재선정합니다.
+  // 사건명/장소/물건/희귀 키워드(=비인물 핵심어)를 인물명보다 우선합니다.
+  // 인물명은 같은 등장인물이 반복되는 장기방에서 오탐이 많으므로 보조점수로만 사용합니다.
+  const LOG_RECALL_DOC_CACHE = new Map();
+
+  function normalizedRecallTerm(value) {
+    return String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  }
+
+  function characterRecallTermSet(room = state.currentRoom) {
+    const out = new Set();
+    for (const slot of (room?.slots || []).filter(s => s.group === 'character')) {
+      for (const term of characterDetectionTerms(slot)) {
+        const normalized = normalizedRecallTerm(term);
+        if (!normalized) continue;
+        out.add(normalized);
+        for (const token of tokenizeRecallText(normalized)) out.add(token);
+      }
+    }
+    return out;
+  }
+
+  function recallDocForBlock(block) {
+    const signature = `recall-v2|${block.key}|${block.raw.length}|${simpleHash(block.raw)}`;
+    const cached = LOG_RECALL_DOC_CACHE.get(signature);
+    if (cached) return cached;
+    const merged = `${block.events} ${block.body}`.toLowerCase();
+    const doc = {
+      block,
+      text: merged,
+      tokens: new Set(tokenizeRecallText(merged)),
+      titleLower: String(block.events || '').toLowerCase(),
+      localCompact:localCompactTerm(merged),
+      localTokens:[...new Set(tokenizeRecallText(merged).map(localCompactTerm))],
+      phrases: String(block.events || '').split(/[·|｜,/]+/).map(x => x.trim().toLowerCase()).filter(x => x.length >= 2),
+    };
+    // 장기방에서도 캐시가 끝없이 커지지 않게 가볍게 상한을 둡니다.
+    if (LOG_RECALL_DOC_CACHE.size > 1800) LOG_RECALL_DOC_CACHE.clear();
+    LOG_RECALL_DOC_CACHE.set(signature, doc);
+    return doc;
+  }
+
+  // Optional derived data only. Original logs, packs, room DB schema and save/merge are unchanged.
+  const SEMANTIC_SEARCH = Object.freeze({model:'gemini-embedding-001',dimensions:256,threshold:0.34,weight:8,batchSize:16,queryCacheLimit:30,chunkChars:1600,queryChars:3200,timeoutMs:4500,indexTimeoutMs:45000});
+  const semanticRuntime={db:null,rooms:new Map(),queries:new Map(),queryRequests:new Map(),cooldowns:new Map(),activeRoom:''};
+  function semanticEnabled(room){return room?.semanticSearchEnabled===true;}
+  function semanticRecallSortScore(room,item){
+    // Previously prepared items may survive the toggle; their semantic contribution
+    // must stop affecting fitting immediately without deleting maintained items.
+    if(!semanticEnabled(room)&&item.recallKeywordScore!=null&&Number.isFinite(Number(item.recallKeywordScore)))return Number(item.recallKeywordScore)+Number(item.recallContextScore||0)+Number(item.recallAliasScore||0)+Number(item.recallFuzzyScore||0)+Number(item.recallCompoundScore||0)-Number(item.recallDuplicatePenalty||0);
+    return Number(item.recallScore||0);
+  }
+  function semanticManualMode(){
+    let provider=String(loadAiSummarySettings().provider||'');
+    // Inspect the stored choice before existing provider normalization defaults it.
+    try{const raw=localStorage.getItem(AI_SUMMARY_SETTINGS_KEY)||GM_getValue(AI_SUMMARY_SETTINGS_KEY,'');provider=String(JSON.parse(raw||'null')?.provider||provider);}catch(_){}
+    return /^(manual|external|clipboard)$/.test(provider);
+  }
+  // Existing Gemini credentials remain usable until a dedicated search key is saved.
+  function readSemanticApiKey(){return readAiSecret('semanticGemini').trim()||readAiSecret('gemini').trim();}
+  function semanticSecret(){return semanticManualMode()?'':readSemanticApiKey();}
+  function saveSemanticApiKey(value){
+    const key=String(value||'').trim();if(!key)throw new Error('의미검색용 Gemini API 키를 입력해 주세요.');
+    const old=readSemanticApiKey();
+    if(!writeAiSecret('semanticGemini',key)||readAiSecret('semanticGemini').trim()!==key)throw new Error('검색용 키를 저장하지 못했습니다. 다시 시도해 주세요.');
+    if(old!==key){
+      for(const runtime of semanticRuntime.rooms.values()){runtime.epoch++;runtime.query=null;runtime.error='';runtime.retryAt=0;}
+      semanticRuntime.queries.clear();semanticRuntime.queryRequests.clear();semanticRuntime.cooldowns.clear();
+    }
+    if(state.currentRoom)semanticRefreshUi(state.currentRoom);
+  }
+  function semanticRoom(room){
+    const id=String(room.chatId);let runtime=semanticRuntime.rooms.get(id);
+    if(!runtime){runtime={rows:new Map(),loaded:false,loading:null,indexing:null,rerun:false,timer:null,epoch:0,query:null,status:'의미 검색 준비 필요',error:'',retryAt:0};semanticRuntime.rooms.set(id,runtime);}
+    return runtime;
+  }
+  function semanticSourceHash(text){return `${String(text).length}:${simpleHash(text)}:${simpleHash([...String(text)].reverse().join(''))}`;}
+  function semanticDocuments(room){
+    const logs=parseDatedLogBlocks((room.slots||[]).find(slot=>slot.id==='logSummary')?.content||'').map(block=>{
+      const source=JSON.stringify([logTimelineLabelOfBlock(block),block.titleText,block.events,block.body,block.raw]);
+      return {kind:'log',key:String(block.key),id:'log:'+block.key,source,sourceHash:semanticSourceHash(source),text:`시간선: ${logTimelineLabelOfBlock(block)}\n날짜·제목: ${block.titleText}\n사건: ${block.events||''}\n${block.body||block.raw}`};
+    });
+    const lore=[];
+    for(const pack of lorePacksFor(room))for(const card of pack.cards||[]){
+      if(!card.id||pack.enabled===false||card.enabled===false||card.mode!=='auto')continue;
+      const fields=loreCardContentFields(card);
+      const source=JSON.stringify([String(pack.id),card.title,card.type,card.aliases||[],card.triggers||[],card.entities||[],fields]);
+      lore.push({kind:'lore',key:`${pack.id}:${card.id}`,id:`lore:${pack.id}:${card.id}`,source,sourceHash:semanticSourceHash(source),text:`제목: ${card.title||''}\n유형: ${card.type||''}\n별칭: ${(card.aliases||[]).join(' · ')}\n감지어: ${(card.triggers||[]).join(' · ')}\n연결 대상: ${(card.entities||[]).join(' · ')}\n${JSON.stringify(fields)}`});
+    }
+    return logs.concat(lore);
+  }
+  function semanticValidRow(row,doc){return !!row&&row.sourceHash===doc.sourceHash&&row.source===doc.source&&row.model===SEMANTIC_SEARCH.model&&row.dimensions===SEMANTIC_SEARCH.dimensions&&Array.isArray(row.vector)&&row.vector.length===SEMANTIC_SEARCH.dimensions&&row.vector.every(Number.isFinite);}
+  function semanticNormalizeVector(vector){
+    if(!Array.isArray(vector)||vector.length!==SEMANTIC_SEARCH.dimensions||!vector.every(Number.isFinite))throw new Error('임베딩 차원 또는 값이 올바르지 않습니다.');
+    const length=Math.hypot(...vector);if(!Number.isFinite(length)||length<=0)throw new Error('비어 있는 임베딩입니다.');return vector.map(value=>value/length);
+  }
+  function semanticCosine(a,b){if(a.length!==b.length)return 0;return Math.max(-1,Math.min(1,a.reduce((sum,value,index)=>sum+value*b[index],0)));}
+  function semanticOpenDb(){
+    if(semanticRuntime.db)return semanticRuntime.db;
+    semanticRuntime.db=new Promise((resolve,reject)=>{const request=indexedDB.open('wish-rp-semantic-derived-v1',1);request.onupgradeneeded=()=>{const store=request.result.createObjectStore('vectors',{keyPath:'id'});store.createIndex('roomId','roomId');};request.onsuccess=()=>resolve(request.result);request.onerror=()=>reject(request.error);request.onblocked=()=>reject(new Error('의미 검색 저장소가 다른 탭에서 준비 중입니다.'));});
+    semanticRuntime.db.catch(()=>{semanticRuntime.db=null;});return semanticRuntime.db;
+  }
+  async function semanticLoad(room,refresh=false){
+    const runtime=semanticRoom(room);if(runtime.loading)return runtime.loading;if(refresh)runtime.loaded=false;if(runtime.loaded)return;
+    runtime.loading=(async()=>{const db=await semanticOpenDb();const rows=await new Promise((resolve,reject)=>{const tx=db.transaction('vectors','readonly'),request=tx.objectStore('vectors').index('roomId').getAll(String(room.chatId));request.onsuccess=()=>resolve(request.result||[]);request.onerror=()=>reject(request.error);});
+      const docs=new Map(semanticDocuments(room).map(doc=>[doc.id,doc]));for(const row of rows)if(semanticValidRow(row,docs.get(row.documentId)||{}))runtime.rows.set(row.documentId,row);runtime.loaded=true;
+    })().finally(()=>{runtime.loading=null;});return runtime.loading;
+  }
+  async function semanticStoreRows(room,rows){
+    if(!rows.length)return;const db=await semanticOpenDb();await new Promise((resolve,reject)=>{const tx=db.transaction('vectors','readwrite');for(const row of rows)tx.objectStore('vectors').put(row);tx.oncomplete=resolve;tx.onabort=()=>reject(tx.error||new Error('검색 인덱스 저장 실패'));tx.onerror=()=>reject(tx.error);});
+  }
+  // Derived quota state contains no credentials or source text. Web Locks coordinate tabs.
+  const semanticApiQueues=new Map();
+  function semanticQuotaKey(secret){return 'RPCM_semantic_quota_v1:'+semanticSourceHash(secret);}
+  function semanticQuotaGate(secret){
+    try{return JSON.parse(GM_getValue(semanticQuotaKey(secret),'{}'))||{};}catch(_){return {};}
+  }
+  function semanticWriteQuota(secret,value){GM_setValue(semanticQuotaKey(secret),JSON.stringify(value));}
+  function semanticApiError(response,data){
+    const error=new Error(`Gemini 의미검색 오류 ${response.status}`);error.httpStatus=response.status;
+    if(response.status===429){
+      const details=Array.isArray(data?.error?.details)?data.error.details:[];
+      const quota=details.flatMap(row=>row.violations||[]).map(row=>String(row.quotaId||row.quotaMetric||row.description||''));
+      const meta=details.map(row=>JSON.stringify(row.metadata||{})).join(' ');
+      const description=quota.join(' ')+' '+meta+' '+String(data?.error?.message||'');
+      error.dailyQuota=/per.?day|\/d(?:ay)?\b|daily/i.test(description);
+      error.zeroQuota=details.some(row=>(row.violations||[]).some(v=>v.quotaValue==='0'));
+      const delay=details.find(row=>String(row['@type']||'').endsWith('RetryInfo'))?.retryDelay;
+      const seconds=typeof delay==='object'?Number(delay.seconds||0)+Number(delay.nanos||0)/1e9:parseFloat(String(delay||'0'));
+      const header=String(response.responseHeaders||'').match(/^retry-after:\s*(.+)$/im)?.[1];
+      const headerMs=header?(Number.isFinite(Number(header))?Number(header)*1000:Math.max(0,Date.parse(header)-Date.now())):0;
+      error.retryMs=Math.max(Number.isFinite(seconds)?seconds*1000:0,headerMs||0);
+      error.message=error.zeroQuota?'Gemini 의미검색 429 · 검색 모델의 허용량이 0입니다. AI Studio 한도를 확인해 주세요':error.dailyQuota?'Gemini 의미검색 429 · 일일 허용량 초과':'Gemini 의미검색 429 · 요청량 제한';
+    }
+    return error;
+  }
+  async function semanticApiRequest(secret,texts,taskType,timeout,valid=()=>true){
+    const deadline=Date.now()+timeout,lockName=semanticQuotaKey(secret);
+    const run=async()=>{
+      if(!valid())throw new Error('의미 검색이 중지되었습니다.');
+      const gate=semanticQuotaGate(secret),now=Date.now();
+      if(now<(gate.retryAt||0))throw new Error(`${gate.message} · 재시도 대기 중`);
+      const wait=Math.max(0,(gate.nextAt||0)-now);
+      if(wait+250>=deadline-now)throw new Error('검색 API 요청 간격 대기 · 이번에는 로컬 검색 사용');
+      if(wait)await new Promise(resolve=>setTimeout(resolve,wait));
+      if(!valid())throw new Error('의미 검색이 중지되었습니다.');
+      const remaining=deadline-Date.now();if(remaining<=0)throw new Error('의미검색 대기 시간 초과 · 로컬 검색 사용');
+      try{
+        // A batch represents multiple embedding inputs; space large batches farther apart.
+        semanticWriteQuota(secret,{...gate,nextAt:Date.now()+Math.max(2000,texts.length*200)});
+        const result=await semanticRawApiRequest(secret,texts,taskType,remaining);
+        semanticWriteQuota(secret,{nextAt:semanticQuotaGate(secret).nextAt||Date.now(),retryAt:0,strikes:0,message:''});
+        return result;
+      }catch(error){
+        if(error.httpStatus===429){
+          const strikes=Math.min(6,Number(gate.strikes||0)+1);
+          const backoff=error.dailyQuota||error.zeroQuota?3600000:Math.min(900000,60000*2**(strikes-1));
+          semanticWriteQuota(secret,{nextAt:Date.now(),retryAt:Date.now()+Math.max(error.retryMs||0,backoff)+Math.floor(Math.random()*1000),strikes,message:error.message});
+        }
+        throw error;
+      }
+    };
+    if(navigator.locks?.request){
+      const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),Math.max(1,timeout));
+      try{return await navigator.locks.request(lockName,{mode:'exclusive',signal:controller.signal},run);}
+      catch(error){if(error.name==='AbortError')throw new Error('의미검색 요청 대기 시간 초과 · 로컬 검색 사용');throw error;}
+      finally{clearTimeout(timer);}
+    }
+    const previous=semanticApiQueues.get(lockName)||Promise.resolve();
+    const next=previous.catch(()=>{}).then(run);semanticApiQueues.set(lockName,next);
+    try{return await next;}finally{if(semanticApiQueues.get(lockName)===next)semanticApiQueues.delete(lockName);}
+  }
+  function semanticScheduleQuotaRetry(room,retryAt){
+    if(!semanticEnabled(room)||state.currentRoom!==room)return;
+    const runtime=semanticRoom(room);clearTimeout(runtime.timer);
+    runtime.timer=setTimeout(()=>{runtime.timer=null;if(state.currentRoom===room&&semanticEnabled(room))void prepareSemanticSearchIndex(room).catch(()=>{});},Math.max(2000,retryAt-Date.now()+1200));
+  }
+
+  function semanticRawApiRequest(secret,texts,taskType,timeout){
+    const model=SEMANTIC_SEARCH.model,list=texts.map(String),base={outputDimensionality:SEMANTIC_SEARCH.dimensions,taskType};
+    const body=list.length===1?{...base,content:{parts:[{text:list[0]}]}}:{requests:list.map(text=>({...base,model:`models/${model}`,content:{parts:[{text}]}}))};
+    return new Promise((resolve,reject)=>{
+      GM_xmlhttpRequest({method:'POST',url:`https://generativelanguage.googleapis.com/v1beta/models/${model}:${list.length===1?'embedContent':'batchEmbedContents'}`,headers:{'Content-Type':'application/json','x-goog-api-key':secret},data:JSON.stringify(body),timeout,
+        onload(response){let data;try{data=JSON.parse(response.responseText);}catch(_){reject(new Error('임베딩 응답 형식 오류'));return;}
+          if(response.status<200||response.status>=300){reject(semanticApiError(response,data));return;}
+          try{const embeddings=list.length===1?[data.embedding]:data.embeddings;if(!Array.isArray(embeddings)||embeddings.length!==list.length)throw new Error('임베딩 결과 개수가 맞지 않습니다.');resolve({vectors:embeddings.map(row=>semanticNormalizeVector(row?.values)),tokens:Number(data.usageMetadata?.promptTokenCount)||0});}catch(error){reject(error);}},
+        ontimeout:()=>reject(new Error('의미검색 요청 시간 초과 · 키워드 검색 사용')),onerror:()=>reject(new Error('의미검색 네트워크 오류 · 키워드 검색 사용'))});
+    });
+  }
+  async function semanticEmbed(room,texts,taskType,timeout){
+    const key=semanticSecret(),epoch=semanticRoom(room).epoch,started=Date.now();if(!key)throw new Error('Gemini API Key 필요');
+    // Encode every field of long documents without relying on silent API truncation.
+    const chunks=[],owners=[],sums=texts.map(()=>Array(SEMANTIC_SEARCH.dimensions).fill(0));
+    texts.forEach((text,owner)=>{const chars=Array.from(String(text));for(let start=0;start<Math.max(1,chars.length);start+=SEMANTIC_SEARCH.chunkChars){chunks.push(chars.slice(start,start+SEMANTIC_SEARCH.chunkChars).join('')||' ');owners.push(owner);}});
+    for(let start=0;start<chunks.length;start+=SEMANTIC_SEARCH.batchSize){
+      if(!semanticEnabled(room)||state.currentRoom!==room||semanticRoom(room).epoch!==epoch||semanticSecret()!==key)throw new Error('의미 검색이 중지되었습니다.');
+      const remaining=taskType==='RETRIEVAL_QUERY'?timeout-(Date.now()-started):timeout;
+      if(remaining<=0)throw new Error('의미검색 요청 시간 초과 · 키워드 검색 사용');
+      const batch=chunks.slice(start,start+SEMANTIC_SEARCH.batchSize),response=await semanticApiRequest(key,batch,taskType,remaining,()=>semanticEnabled(room)&&state.currentRoom===room&&semanticRoom(room).epoch===epoch&&semanticSecret()===key);
+      recordRoomAiUsage(room,taskType==='RETRIEVAL_QUERY'?'semanticQuery':'semanticIndex','gemini',SEMANTIC_SEARCH.model,{inputTokens:response.tokens,outputTokens:0},{},{prompt:batch.join('')});
+      response.vectors.forEach((vector,index)=>vector.forEach((value,dimension)=>sums[owners[start+index]][dimension]+=value));
+      refreshAiRoomUsageUi(room);queueRoomAutoSave(room,800);
+    }
+    return sums.map(semanticNormalizeVector);
+  }
+  function semanticStatus(room){
+    if(!semanticEnabled(room))return '의미 검색 OFF';
+    if(semanticManualMode())return '외부 AI 복붙 모드 · 키워드 검색 사용';
+    if(!semanticSecret())return '의미검색용 Gemini 키 필요 · 로컬 검색 사용';
+    const runtime=semanticRoom(room),gate=semanticQuotaGate(semanticSecret());if(gate.retryAt>Date.now())return `${gate.message} · 약 ${Math.ceil((gate.retryAt-Date.now())/1000)}초 후 재확인 · 로컬 검색 사용`;if(runtime.indexing)return runtime.status;
+    const docs=semanticDocuments(room),stale=docs.filter(doc=>!semanticValidRow(runtime.rows.get(doc.id),doc)).length;
+    if(runtime.error)return runtime.error+' · 키워드 검색 병행';
+    return !runtime.loaded?'의미 검색 준비 필요':stale?`변경된 ${stale}개 재준비 필요`:'의미 검색 최신';
+  }
+  function semanticRefreshUi(room){if(state.currentRoom!==room)return;state.modal?.querySelectorAll('[data-semantic-status]').forEach(node=>node.textContent=semanticStatus(room));state.modal?.querySelectorAll('[data-semantic-enabled]').forEach(node=>node.checked=semanticEnabled(room));}
+  function semanticUiHtml(room){return `<article class="rpcm-pref-card rpcm-semantic-settings"><header><h3>의미 검색</h3><span class="rpcm-pref-scope">현재 방</span></header><label class="rpcm-pref-row"><span>의미 검색 사용<small>키워드 검색에 의미가 가까운 로그·자동 자료집을 더합니다. AI 맥락 검토는 별도로 적용됩니다.</small></span><input type="checkbox" data-semantic-enabled aria-label="의미 검색 사용" ${semanticEnabled(room)?'checked':''}></label><div class="rpcm-pref-row"><button type="button" class="rpcm-btn secondary" data-semantic-prepare>검색 인덱스 재확인</button><span data-semantic-status role="status">${esc(semanticStatus(room))}</span></div><small>AI → API·모델 설정의 의미검색 전용 연결에서 Gemini 키를 저장하세요. 다른 AI 기능은 공용 연결을 사용합니다.</small></article>`;}
+  function semanticClearQueries(room){const id=String(room.chatId);semanticRoom(room).query=null;semanticRoom(room).epoch++;for(const [key,row]of semanticRuntime.queries)if(row.roomId===id)semanticRuntime.queries.delete(key);}
+  async function semanticSetEnabled(room,enabled){
+    const old=room.semanticSearchEnabled;room.semanticSearchEnabled=enabled;semanticClearQueries(room);
+    try{await saveRoom(room);}catch(error){room.semanticSearchEnabled=old;semanticRefreshUi(room);throw error;}
+    semanticRefreshUi(room);if(enabled)queueSemanticIndexRefresh(room,'enabled');
+  }
+  function bindSemanticUi(overlay,room){
+    overlay.querySelectorAll('[data-semantic-enabled]').forEach(node=>node.onchange=()=>{void semanticSetEnabled(room,node.checked).catch(error=>notify('의미검색 설정 저장 실패: '+error.message,'error'));});
+    overlay.querySelectorAll('[data-semantic-prepare]').forEach(node=>node.onclick=async()=>{node.disabled=true;try{if(!semanticEnabled(room))await semanticSetEnabled(room,true);await prepareSemanticSearchIndex(room,true);}catch(error){semanticRoom(room).error=error.message;semanticRefreshUi(room);}finally{node.disabled=false;}});
+    if(semanticEnabled(room))void semanticLoad(room).then(()=>semanticRefreshUi(room)).catch(()=>{});
+  }
+  function queueSemanticIndexRefresh(room,reason='change'){
+    if(!room||!semanticEnabled(room)){if(room)semanticClearQueries(room);return;}
+    const runtime=semanticRoom(room);if(runtime.indexing){runtime.rerun=true;return;}
+    clearTimeout(runtime.timer);runtime.timer=setTimeout(()=>{runtime.timer=null;if(state.currentRoom!==room||!semanticEnabled(room))return;void prepareSemanticSearchIndex(room).catch(error=>{runtime.error=error.message;semanticRefreshUi(room);});},1800);
+  }
+  async function prepareSemanticSearchIndex(room,force=false){
+    const runtime=semanticRoom(room);if(runtime.indexing){runtime.rerun=true;return runtime.indexing;}
+    if(!semanticEnabled(room)||state.currentRoom!==room)return;
+    if(!semanticSecret()){semanticRefreshUi(room);return;}
+    const gate=semanticQuotaGate(semanticSecret());
+    if(Date.now()<Math.max(runtime.retryAt,gate.retryAt||0)){semanticScheduleQuotaRetry(room,Math.max(runtime.retryAt,gate.retryAt||0));semanticRefreshUi(room);return;}
+    const epoch=runtime.epoch,roomId=String(room.chatId);runtime.error='';runtime.indexError='';
+    const current=()=>state.currentRoom===room&&semanticEnabled(room)&&runtime.epoch===epoch&&String(room.chatId)===roomId;
+    const runIndex=async()=>{
+      await semanticLoad(room,true);if(!current())return;
+      const docs=semanticDocuments(room),ids=new Set(docs.map(doc=>doc.id));for(const id of runtime.rows.keys())if(!ids.has(id))runtime.rows.delete(id);
+      const stale=docs.filter(doc=>!semanticValidRow(runtime.rows.get(doc.id),doc));let done=0;
+      for(let index=0;index<stale.length;index+=SEMANTIC_SEARCH.batchSize){
+        if(!current())return;runtime.status=`검색 준비 중 ${done}/${stale.length}`;semanticRefreshUi(room);
+        const batch=stale.slice(index,index+SEMANTIC_SEARCH.batchSize),vectors=await semanticEmbed(room,batch.map(doc=>stripAutomationNoise(doc.text)),'RETRIEVAL_DOCUMENT',SEMANTIC_SEARCH.indexTimeoutMs);
+        if(!current())return;const latest=new Map(semanticDocuments(room).map(doc=>[doc.id,doc])),rows=[];
+        batch.forEach((doc,i)=>{const fresh=latest.get(doc.id);if(!fresh||fresh.source!==doc.source){runtime.rerun=true;return;}rows.push({id:JSON.stringify([roomId,doc.id,doc.sourceHash,SEMANTIC_SEARCH.model,SEMANTIC_SEARCH.dimensions]),roomId,documentId:doc.id,key:doc.key,kind:doc.kind,source:doc.source,sourceHash:doc.sourceHash,model:SEMANTIC_SEARCH.model,dimensions:SEMANTIC_SEARCH.dimensions,vector:vectors[i],updatedAt:nowIso()});});
+        await semanticStoreRows(room,rows);if(!current())return;
+        const stillCurrent=new Map(semanticDocuments(room).map(doc=>[doc.id,doc]));for(const row of rows){if(semanticValidRow(row,stillCurrent.get(row.documentId)||{}))runtime.rows.set(row.documentId,row);else runtime.rerun=true;}
+        done+=batch.length;runtime.status=`검색 준비 중 ${done}/${stale.length}`;semanticRefreshUi(room);
+      }
+      runtime.status=stale.length?'의미 검색 준비 완료':'이미 최신 상태';runtime.retryAt=0;
+    };
+    // Tabs share only the derived index lock; the Manager's save locks are untouched.
+    const work=navigator.locks?.request?navigator.locks.request('wish-semantic-index:'+roomId,{mode:'exclusive'},async()=>{if(current())return runIndex();}):runIndex();runtime.indexing=work;
+    try{await work;}catch(error){if(current()){runtime.error=String(error.message||error);runtime.indexError=runtime.error;runtime.retryAt=Math.max(Date.now()+60000,semanticQuotaGate(semanticSecret()).retryAt||0);semanticScheduleQuotaRetry(room,runtime.retryAt);throw error;}}
+    finally{runtime.indexing=null;semanticRefreshUi(room);if(runtime.rerun){runtime.rerun=false;if(current())queueSemanticIndexRefresh(room,'changed-during-indexing');}}
+  }
+  function buildSemanticQueryText(userText,previousAssistant=''){
+    const user=stripAutomationNoise(String(userText||''),true).trim().slice(0,1800);
+    if(!user)return '';
+    const short=user.length<90||/(그거|그때|걔|아까|그 사람|그곳|그걸|그 일이|그 물건)/.test(user);
+    const previous=short?stripAutomationNoise(String(previousAssistant||''),true).trim().slice(-1800):'';
+    return `CURRENT_USER:\n${user}${previous?'\n\nPREVIOUS_ASSISTANT_CONTEXT:\n'+previous:''}`.slice(0,SEMANTIC_SEARCH.queryChars);
+  }
+  function semanticQueryForContext(context,messages=null){
+    if(messages){const list=messages.filter(message=>['user','assistant'].includes(messageRoleOf(message))),at=list.findIndex(message=>messageRoleOf(message)==='user');if(at>=0){const previous=list.slice(at+1).find(message=>messageRoleOf(message)==='assistant');return buildSemanticQueryText(messageTextOf(list[at]),messageTextOf(previous));}}
+    return buildSemanticQueryText(String(context||'').slice(-1800));
+  }
+  function semanticContextHash(context){return semanticSourceHash(stripAutomationNoise(String(context||'')));}
+  async function prepareSemanticRecall(room,context,messages=null){
+    const runtime=semanticRoom(room);if(!semanticEnabled(room)){semanticClearQueries(room);return;}
+    if(semanticRuntime.activeRoom!==String(room.chatId)){semanticRuntime.queries.clear();semanticRuntime.activeRoom=String(room.chatId);}
+    if(!semanticSecret()){runtime.query=null;semanticRefreshUi(room);return;}
+    const epoch=runtime.epoch,contextHash=semanticContextHash(context);
+    if(!messages&&runtime.query?.contextHash===contextHash)return;
+    const queryText=semanticQueryForContext(context,messages);
+    if(!queryText)return;
+    try{
+      await semanticLoad(room);if(!semanticEnabled(room)||runtime.epoch!==epoch||state.currentRoom!==room)return;
+      // Validate sources on every read; partial fresh indexes can already serve a query.
+      const docs=semanticDocuments(room);if(docs.some(doc=>!semanticValidRow(runtime.rows.get(doc.id),doc)))queueSemanticIndexRefresh(room,'search-stale');
+      if(!docs.some(doc=>semanticValidRow(runtime.rows.get(doc.id),doc))){runtime.query=null;return;}
+      const key=JSON.stringify([String(room.chatId),SEMANTIC_SEARCH.model,SEMANTIC_SEARCH.dimensions,semanticSourceHash(queryText)]);
+      let cached=semanticRuntime.queries.get(key);
+      if(cached?.text!==queryText){
+        if(Date.now()<(semanticRuntime.cooldowns.get(String(room.chatId))||0)){runtime.query=null;return;}
+        let request=semanticRuntime.queryRequests.get(key);
+        if(!request){request=semanticEmbed(room,[queryText],'RETRIEVAL_QUERY',SEMANTIC_SEARCH.timeoutMs).then(vectors=>({roomId:String(room.chatId),text:queryText,vector:vectors[0]}));semanticRuntime.queryRequests.set(key,request);request.finally(()=>{if(semanticRuntime.queryRequests.get(key)===request)semanticRuntime.queryRequests.delete(key);}).catch(()=>{});}
+        cached=await request;
+        if(!semanticEnabled(room)||runtime.epoch!==epoch||state.currentRoom!==room)return;
+        semanticRuntime.queries.set(key,cached);while(semanticRuntime.queries.size>SEMANTIC_SEARCH.queryCacheLimit)semanticRuntime.queries.delete(semanticRuntime.queries.keys().next().value);
+      }else{semanticRuntime.queries.delete(key);semanticRuntime.queries.set(key,cached);}
+      if(!semanticEnabled(room)||runtime.epoch!==epoch||state.currentRoom!==room)return;
+      runtime.query={contextHash,vector:cached.vector};if(!runtime.indexError)runtime.error='';
+    }catch(error){if(runtime.epoch===epoch){runtime.query=null;runtime.error=String(error.message||error);semanticRuntime.cooldowns.set(String(room.chatId),Math.max(Date.now()+60000,semanticQuotaGate(semanticSecret()).retryAt||0));semanticRefreshUi(room);}}
+  }
+  function semanticScoresForContext(room,context,kind){
+    const scores=new Map();if(!semanticEnabled(room)||!semanticSecret())return scores;const runtime=semanticRoom(room),query=runtime.query;
+    if(!query||query.contextHash!==semanticContextHash(context))return scores;
+    for(const doc of semanticDocuments(room)){if(doc.kind!==kind)continue;const row=runtime.rows.get(doc.id);if(semanticValidRow(row,doc))scores.set(doc.key,semanticCosine(query.vector,row.vector));}
+    return scores;
+  }
+
+  // Read-through cache: raw completed turns only; gates/cursors/counts are recalculated.
+  const aiMemoryHistoryCache=new Map();
+  const AI_MEMORY_HISTORY_AUDIT_MS=120000;
+  let aiMemoryHistoryGeneration=0;
+  function invalidateAiMemoryHistory(){aiMemoryHistoryCache.clear();aiMemoryHistoryGeneration++;storyReviewSnapshotCache.clear();}
+  function aiMemoryCacheBasis(room){const config=aiMemoryConfig(room);return JSON.stringify([apiChatIdOf(room),room._rpcmRevision,room.updatedAt,aiMemoryHistoryGeneration,config.enabled,Object.entries(config.areas).map(([area,row])=>[area,row.enabled,row.interval,row.baseline,row.cursor]),Object.entries(room.manualUpdateCheckpoints||{}).map(([task,row])=>[task,row.endMessageId,row.appliedAt]),room.activeLogTimeline]);}
+  async function aiMemoryPlanningTurns(room,force=false){
+    const roomId=String(room.chatId),recent=await fetchRecentMessages(apiChatIdOf(room),30);
+    if(state.currentRoom!==room)throw new Error('RP 조회 중 채팅방이 바뀌었습니다.');
+    const signature=JSON.stringify(recent.map(message=>[messageIdOf(message),messageRoleOf(message),messageTextOf(message),message.status,message.updatedAt,message.generationStatus]));
+    const basis=aiMemoryCacheBasis(room),cached=aiMemoryHistoryCache.get(roomId),now=Date.now();
+    // Empty/pending responses and forced checks use the original full-history path.
+    const certain=recent.length>0&&!recent.some(message=>isIncompleteAiSourceMessage(message));
+    if(!force&&certain&&cached&&cached.signature===signature&&cached.basis===basis&&now-cached.at<AI_MEMORY_HISTORY_AUDIT_MS)return settledAutomaticTurns(cached.turns);
+    const config=aiMemoryConfig(room),areas=Object.keys(AI_MEMORY_AREAS).filter(area=>config.areas[area].enabled);
+    const turns=await aiMemoryScopedTurns(room,areas.length?areas:Object.keys(AI_MEMORY_AREAS));
+    if(state.currentRoom!==room)throw new Error('RP 조회 중 채팅방이 바뀌었습니다.');
+    aiMemoryHistoryCache.clear(); // Keep at most the current room's full history.
+    if(certain)aiMemoryHistoryCache.set(roomId,{signature,basis:aiMemoryCacheBasis(room),at:Date.now(),turns});
+    return settledAutomaticTurns(turns);
+  }
+
+  // Local precision layer. Never changes the legacy eligibility gate or the budget.
+  const LOCAL_RECALL = Object.freeze({contextChars:1200,contextWeight:.3,contextCap:2.2,aliasWeight:.35,aliasCap:1.6,fuzzyCap:.8,compoundCap:2.4,duplicateCap:2.4});
+  const localRecallCache=new WeakMap(),localRecallQueries=new WeakMap();
+  const LOCAL_OBJECT_TERMS=new Set(['목걸이','군번줄','도그태그','반지','시계','손목시계','열쇠','편지','상자','권총','칼','사진','휴대폰','지갑']);
+  const LOCAL_LOCATION_TERMS=new Set(['호숫가','호수','해변','숙소','기지','병원','식당','사무실','은행','공항','창고','복도','부두','학교','저택']);
