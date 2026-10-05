@@ -1,0 +1,999 @@
+        for (const key of String(group.dataset.keys || '').split('|').filter(Boolean)) {
+          const cb = backdrop.querySelector(`.rpcm-log-row[data-log-key="${CSS.escape(key)}"] .rpcm-log-manual`);
+          if (cb) cb.checked = desired;
+        }
+        if (desired) setPickedPanelOpen(true);
+        updateGroupState();
+        refreshPickedManager();
+        applyLogFilters();
+      });
+      backdrop.querySelector('#rpcm-log-clear-manual').onclick = () => {
+        backdrop.querySelectorAll('.rpcm-log-manual').forEach(cb => { cb.checked = false; });
+        updateGroupState();
+        refreshPickedManager();
+        applyLogFilters();
+      };
+      backdrop.querySelector('[data-act="confirm"]').onclick = () => {
+        const nextPinned = [], nextExcluded = [], nextManual = [], nextFavorite = [];
+        const timelineByKey = new Map();
+        backdrop.querySelectorAll('.rpcm-log-row').forEach(row => {
+          const key = row.dataset.logKey;
+          if (row.querySelector('.rpcm-log-pin')?.checked) nextPinned.push(key);
+          if (row.querySelector('.rpcm-log-exclude')?.checked) nextExcluded.push(key);
+          if (row.querySelector('.rpcm-log-manual')?.checked) nextManual.push(key);
+          if (row.querySelector('.rpcm-log-favorite')?.checked) nextFavorite.push(key);
+          timelineByKey.set(String(key), String(row.querySelector('.rpcm-log-timeline-select')?.value || DEFAULT_LOG_TIMELINE));
+        });
+        room.autoLogPinnedKeys = nextPinned;
+        room.autoLogExcludedKeys = nextExcluded;
+        room.manualLogSelectedKeys = nextManual;
+        room.favoriteLogKeys = nextFavorite;
+        const replacements = blocks.filter(block => !deletedBlockKeys.has(String(block.key))).map(block => {
+          const targetTimeline = timelineByKey.get(String(block.key)) || logTimelineLabelOfBlock(block);
+          const nextHeading = formatLogHeadingForTimeline(block, targetTimeline);
+          return nextHeading === block.heading ? null : { start:block.sourceStart, end:block.headingEnd, text:nextHeading };
+        }).filter(Boolean).sort((a,b) => b.start - a.start);
+        const deletions = blocks.filter(block => deletedBlockKeys.has(String(block.key))).map(block => ({ start:block.sourceStart, end:block.sourceEnd, text:'' }));
+        const edits = [...replacements, ...deletions].sort((a,b) => b.start - a.start || b.end - a.end);
+        if (edits.length) {
+          let nextContent = String(log.content || '');
+          edits.forEach(edit => { nextContent = nextContent.slice(0, edit.start) + edit.text + nextContent.slice(edit.end); });
+          nextContent = sortDatedLogTextByTimeline(nextContent.trim(), room);
+          const nextBlocks = parseDatedLogBlocks(nextContent);
+          const survivingBlocks = blocks.filter(block => !deletedBlockKeys.has(String(block.key)));
+          if (nextBlocks.length !== survivingBlocks.length) { notify('시간선 이동·삭제 후 블록 수가 예상과 달라져 적용을 중단했습니다.', 'error', 5200); return; }
+          log.content = nextContent;
+          const keyMap = new Map();
+          const nextQueues = new Map();
+          nextBlocks.forEach(block => {
+            const signature = `${block.heading}\n${block.body}`;
+            if (!nextQueues.has(signature)) nextQueues.set(signature, []);
+            nextQueues.get(signature).push(block);
+          });
+          survivingBlocks.forEach(block => {
+            const targetTimeline = timelineByKey.get(String(block.key)) || logTimelineLabelOfBlock(block);
+            const signature = `${formatLogHeadingForTimeline(block, targetTimeline)}\n${block.body}`;
+            const nextBlock = nextQueues.get(signature)?.shift();
+            if (nextBlock) keyMap.set(String(block.key), String(nextBlock.key));
+          });
+          remapLogSelectionKeys(room, keyMap, nextBlocks);
+        }
+        room.logTimelines = timelineLabels.slice();
+        room.activeLogTimeline = cleanLogTimelineLabel(activeTimelineSelect?.value) || DEFAULT_LOG_TIMELINE;
+        normalizeRoomLogTimelines(room);
+        finish(true);
+      };
+      updateGroupState();
+      refreshPickedManager();
+      applyLogFilters();
+      backdrop.onclick = e => { if (e.target === backdrop) finish(false); };
+    });
+  }
+
+  function openDuplicateLogResolverDialog(room) {
+    return new Promise(resolve => {
+      const log = (room.slots || []).find(s => s.id === 'logSummary');
+      const blocks = parseDatedLogBlocks(log?.content || '');
+      const groups = duplicateLogDateGroups(room);
+      if (!groups.length) { notify('현재 중복 날짜 로그가 없습니다.', 'success', 3200); resolve(false); return; }
+
+      const old = document.getElementById('rpcm-dup-dialog-backdrop');
+      if (old) old.remove();
+      const backdrop = document.createElement('div');
+      backdrop.id = 'rpcm-dup-dialog-backdrop';
+      const branchHint = groups.map(timelineBranchHintForGroup).find(Boolean) || '';
+
+      const groupsHtml = groups.map((group, gi) => {
+        const hint = timelineBranchHintForGroup(group);
+        return `
+        <div class="rpcm-dup-group" data-date-key="${esc(group.dateKey)}">
+          <div class="rpcm-dup-group-head"><strong>${esc(group.label)}</strong>${hint ? `<em class="rpcm-timeline-hint">↩ 분기 신호 감지 · ${esc(hint)}</em>` : ''}<span>${group.blocks.length}개 블록 감지 · 유지할 블록 하나를 선택하세요.</span></div>
+          ${group.blocks.map((b, bi) => `
+            <div class="rpcm-dup-choice ${bi === group.blocks.length - 1 ? 'is-selected' : ''}" data-block-index="${b.index}">
+              <label class="rpcm-dup-choice-head">
+                <input type="radio" name="rpcm-dup-${gi}" value="${b.index}" ${bi === group.blocks.length - 1 ? 'checked' : ''}>
+                <strong>${bi + 1}번째 블록${bi === group.blocks.length - 1 ? ' · 기본 선택' : ''}</strong>
+                <span>${formatCount(b.raw.length)}자</span>
+              </label>
+              <label class="rpcm-dup-heading"><span>날짜 · 키워드 제목</span><input type="text" value="${esc(b.heading)}" placeholder="[2027년 10월 4일-키워드]" spellcheck="false"></label>
+              <textarea class="rpcm-dup-editor" spellcheck="false">${esc(b.body)}</textarea>
+            </div>`).join('')}
+        </div>`;
+      }).join('');
+
+      backdrop.innerHTML = `
+        <div class="rpcm-log-dialog rpcm-dup-dialog" role="dialog" aria-modal="true">
+          <div class="rpcm-lib-dialog-head"><div><div class="rpcm-lib-dialog-title">중복 날짜 로그 정리</div><div class="rpcm-lib-dialog-desc">같은 시간선·날짜로 감지된 블록입니다. 실제 중복이면 하나를 남기고, 시간회귀·IF 분기라면 각각 다른 시간선 폴더로 보관하세요.</div></div><button type="button" class="rpcm-lib-close" aria-label="닫기" data-rpcm-close="icon">✕</button></div>
+          <div class="rpcm-log-help">${branchHint ? `<b>↩ 시간선 분기 가능성을 감지했습니다.</b> ‘${esc(branchHint)}’ 문구가 있습니다. 자동 확정하지 않으니 아래 블록을 확인해 주세요.<br>` : ''}<b>일반 중복</b>=유지할 블록 하나를 선택 · <b>시간선 분기</b>=첫 블록은 기본 시간선, 다음 블록은 회귀 시간선 또는 추가 회차로 나눠 보관</div>
+          <div class="rpcm-log-list rpcm-dup-list">${groupsHtml}</div>
+          <div class="rpcm-lib-dialog-actions"><button type="button" class="rpcm-btn ${branchHint ? 'primary' : 'secondary'}" id="rpcm-split-duplicate-timelines">${branchHint ? '↩ 분기 감지 · ' : '🗂️ '}시간선 폴더로 나누기</button><div class="rpcm-spacer"></div><button type="button" class="rpcm-btn secondary" data-act="cancel">취소</button><button type="button" class="rpcm-btn primary" data-act="confirm">선택한 블록으로 정리</button></div>
+        </div>`;
+      document.body.appendChild(backdrop);
+
+      const finish = value => { backdrop.remove(); resolve(value); };
+      backdrop.querySelector('.rpcm-lib-close').onclick = () => finish(false);
+      backdrop.querySelector('[data-act="cancel"]').onclick = () => finish(false);
+      backdrop.querySelectorAll('.rpcm-dup-choice input[type="radio"]').forEach(radio => {
+        radio.onchange = () => {
+          const group = radio.closest('.rpcm-dup-group');
+          group?.querySelectorAll('.rpcm-dup-choice').forEach(choice => choice.classList.toggle('is-selected', !!choice.querySelector('input[type="radio"]')?.checked));
+        };
+      });
+      backdrop.querySelector('#rpcm-split-duplicate-timelines').onclick = () => {
+        const branchCount = Math.max(...groups.map(group => group.blocks.length));
+        const labels = [DEFAULT_LOG_TIMELINE];
+        for (let index = 1; index < branchCount; index++) {
+          const fallback = index === 1 ? DEFAULT_REGRESSION_TIMELINE : `${index}회차`;
+          const value = prompt(`${index + 1}번째 블록이 들어갈 시간선 이름`, fallback);
+          if (value == null) return;
+          const label = cleanLogTimelineLabel(value) || DEFAULT_LOG_TIMELINE;
+          if (!label) { notify('시간선 이름을 입력해 주세요.', 'warn', 3200); return; }
+          if (labels.some(item => normalizedLogTimelineKey(item) === normalizedLogTimelineKey(label))) { notify('시간선 이름은 서로 달라야 합니다.', 'warn', 3600); return; }
+          labels.push(label);
+        }
+        const targetByIndex = new Map();
+        groups.forEach(group => group.blocks.forEach((block, index) => targetByIndex.set(block.index, labels[index])));
+        const replacements = blocks.filter(block => targetByIndex.has(block.index)).map(block => ({
+          start:block.sourceStart,
+          end:block.headingEnd,
+          text:formatLogHeadingForTimeline(block, targetByIndex.get(block.index)),
+        })).sort((a,b) => b.start - a.start);
+        let next = String(log?.content || '');
+        replacements.forEach(replacement => { next = next.slice(0, replacement.start) + replacement.text + next.slice(replacement.end); });
+        const nextBlocks = parseDatedLogBlocks(next);
+        if (nextBlocks.length !== blocks.length) { notify('시간선 분리 후 블록 수가 달라져 적용을 중단했습니다.', 'error', 5200); return; }
+        log.content = next;
+        remapLogSelectionKeysByIndex(room, blocks, nextBlocks);
+        room.logTimelines = [...new Set([...(room.logTimelines || []), ...labels])];
+        room.activeLogTimeline = labels[labels.length - 1] || activeLogTimelineLabel(room);
+        normalizeRoomLogTimelines(room);
+        finish(true);
+      };
+      backdrop.querySelector('[data-act="confirm"]').onclick = () => {
+        const selectedByDate = new Map();
+        for (const group of groups) {
+          const groupEl = backdrop.querySelector(`.rpcm-dup-group[data-date-key="${CSS.escape(group.dateKey)}"]`);
+          const selected = groupEl?.querySelector('input[type="radio"]:checked');
+          if (!selected) { notify(`${group.label}: 유지할 블록을 선택해 주세요.`, 'warn', 4200); return; }
+          const choice = selected.closest('.rpcm-dup-choice');
+          const rawHeading = String(choice?.querySelector('.rpcm-dup-heading input')?.value || '').replace(/[\r\n]+/g, ' ').trim();
+          const innerHeading = rawHeading.replace(/^\[/, '').replace(/\]$/, '').trim();
+          const heading = /^\[[^\]\n]+\]$/.test(rawHeading) ? rawHeading : innerHeading ? `[${innerHeading}]` : '';
+          const body = String(choice?.querySelector('.rpcm-dup-editor')?.value || '').trim();
+          const edited = `${heading}${body ? `\n${body}` : ''}`.trim();
+          if (!heading || parseDatedLogBlocks(edited).length !== 1) {
+            notify(`${group.label}: 날짜 제목을 [2027년 10월 4일-키워드] 형태로 입력해 주세요.`, 'warn', 5200);
+            return;
+          }
+          selectedByDate.set(group.dateKey, { index: Number(selected.value), text: edited });
+        }
+
+        const src = normalizeLineBreaks(log?.content || '');
+        const prefix = blocks.length && blocks[0].sourceStart > 0 ? src.slice(0, blocks[0].sourceStart).trim() : '';
+        const duplicateDates = new Set(groups.map(g => g.dateKey));
+        const pieces = prefix ? [prefix] : [];
+        const pieceOriginKeys = [];
+        for (const block of blocks) {
+          if (!duplicateDates.has(block.dateKey)) {
+            pieces.push(String(block.raw || '').trim());
+            pieceOriginKeys.push(String(block.key));
+            continue;
+          }
+          const chosen = selectedByDate.get(block.dateKey);
+          if (chosen?.index === block.index) {
+            pieces.push(chosen.text);
+            pieceOriginKeys.push(String(block.key));
+          }
+        }
+        const liveLog = (room.slots || []).find(s => s.id === 'logSummary');
+        if (!liveLog) { notify('현재 로그요약 항목을 찾지 못해 적용을 중단했습니다.', 'error', 6200); return; }
+        liveLog.content = pieces.filter(Boolean).join('\n\n').trim();
+        const nextBlocks = parseDatedLogBlocks(liveLog.content);
+        const keyMap = new Map();
+        pieceOriginKeys.forEach((origin, index) => {
+          if (nextBlocks[index]) keyMap.set(origin, String(nextBlocks[index].key));
+        });
+        remapLogSelectionKeys(room, keyMap, nextBlocks);
+        finish(true);
+      };
+      backdrop.onclick = e => { if (e.target === backdrop) finish(false); };
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // IndexedDB
+  // ---------------------------------------------------------------------------
+
+  function openDb() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open(APP.dbName, APP.dbVersion);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(APP.storeName)) {
+          db.createObjectStore(APP.storeName, { keyPath: 'chatId' });
+        }
+        if (!db.objectStoreNames.contains(APP.libraryStoreName)) {
+          db.createObjectStore(APP.libraryStoreName, { keyPath: 'scopeId' });
+        }
+      };
+      req.onsuccess = () => {const db=req.result;db.onversionchange=()=>{db.close();notify('저장소가 다른 탭에서 변경되었습니다. 새로고침 후 다시 저장하세요.','warn',8000);};resolve(db);};
+      req.onblocked=()=>notify('다른 RP Manager 탭이 저장소를 사용 중입니다. 다른 탭을 닫고 다시 시도하세요.','warn',8000);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  function dbTx(mode, fn) {
+    return new Promise((resolve, reject) => {
+      const tx = state.db.transaction(APP.storeName, mode);
+      const store = tx.objectStore(APP.storeName);
+      let result;
+      try {
+        result = fn(store);
+      } catch (e) {
+        reject(e);
+        return;
+      }
+      tx.oncomplete = () => resolve(result);
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error('DB transaction aborted'));
+    });
+  }
+
+  async function getRoom(chatId, apiChatId = null) {
+    const room = await new Promise((resolve, reject) => {
+      const tx = state.db.transaction(APP.storeName, 'readonly');
+      const req = tx.objectStore(APP.storeName).get(chatId);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+
+    if (room) {
+      rpcmRememberRoomBaseline(room);
+      const needsStoryLogMigration = !room.storyLogReviewRevisionV1 || !room.storyTimelineGuideRevisionV15;
+      if (!Array.isArray(room.lorePacks)) room.lorePacks = [];
+      normalizeRoomSlots(room);
+      const oldPersonBuiltin = isLegacyBuiltinPersonGuide(room.personStateGuide);
+      if (oldPersonBuiltin) room.personStateGuide = canonicalGuideText('personInfo');
+      const oldLoreBuiltin = [PREVIOUS_MANUAL_LORE_GUIDE_V2_0_1,PREVIOUS_CANONICAL_GUIDES_V01456.lore].includes(room.manualUpdateGuides?.lore);
+      if (oldLoreBuiltin) delete room.manualUpdateGuides.lore;
+      const oldTimelineBuiltin = !room.storyTimelineGuide || room.storyTimelineGuide === STORY_TIMELINE_GUIDE_V15 || room.storyTimelineGuide === LEGACY_CANONICAL_GUIDES.timeline || room.storyTimelineGuide === PREVIOUS_CANONICAL_GUIDES_V01456.timeline;
+      if (oldTimelineBuiltin) {
+        room.storyTimelineGuide = canonicalGuideText('timeline');
+        room.storyTimelineGuideSource = 'builtin-v1.7.2';
+      }
+      normalizeAiReviewInbox(room);
+      room.maxChars = APP.defaultMaxChars;
+      room.apiChatId = room.apiChatId || apiChatId || String(chatId).split('::')[0];
+      if (room.pending) {
+        room.pending.contextBlock = String(room.pending.contextBlock || '');
+        room.pending.sessionStartedAt = Number(room.pending.sessionStartedAt || room.pending.armedAt || Date.now());
+        normalizePendingSlotMetadata(room);
+        if (!Array.isArray(room.pending.items) || !room.pending.items.length) {
+          const legacyTotal = room.pending.totalTurns == null ? APP.defaultRetentionTurns : normalizeRetentionTurns(room.pending.totalTurns);
+          const legacyUsed = Number(room.pending.usedTurns || 0);
+          room.pending.items = selectedSlots(room).map(slot => ({
+            slotId: slot.id, title: slot.title, group: slot.group, content: String(slot.content || ''),
+            totalTurns: normalizeRetentionTurns(slot.retentionTurns ?? legacyTotal), usedTurns: legacyUsed,
+          }));
+        }
+      }
+      if (needsStoryLogMigration || oldPersonBuiltin || oldLoreBuiltin || oldTimelineBuiltin) await saveRoom(room);
+      return room;
+    }
+
+    const created = {
+      chatId,
+      apiChatId: apiChatId || String(chatId).split('::')[0],
+      label: '',
+      maxChars: APP.defaultMaxChars,
+      slots: cloneSlots(),
+      pending: null,
+      autoCharacterDetection: false,
+      autoCharacterIncludeUnchecked: false,
+      autoCharacterLibraryId: '',
+      lastExtraLibraryId: '',
+      autoCharacterResetOnReappear: true,
+      autoItemDetection: true,
+      autoItemResetOnReappear: true,
+      allowedDuplicateItemSignatures: [],
+      autoLogRecallEnabled: false,
+      autoLogRecentBlocks: APP.defaultRecentLogBlocks,
+      autoLogRelevance: 'balanced',
+      autoLogRelatedBlocks: APP.defaultRelatedLogBlocks,
+      autoLogPinnedKeys: [],
+      autoLogExcludedKeys: [],
+      manualLogSelectedKeys: [],
+      favoriteLogKeys: [],
+      acceptedUnknownLogKeys: [],
+      aiContextLogRerankEnabled: false,
+      aiApiUsage: { version:1, features:{ summary:emptyRoomAiFeatureUsage(), timeline:emptyRoomAiFeatureUsage(), context:emptyRoomAiFeatureUsage(), itemFolder:emptyRoomAiFeatureUsage(), utility:emptyRoomAiFeatureUsage(), longTermManualFirst:emptyRoomAiFeatureUsage(), longTermAutoFirst:emptyRoomAiFeatureUsage(), longTermSecond:emptyRoomAiFeatureUsage(), longTermNative:emptyRoomAiFeatureUsage() }, history:[] },
+      logTimelines: [DEFAULT_LOG_TIMELINE],
+      activeLogTimeline: DEFAULT_LOG_TIMELINE,
+      storyTimelineCards: [],
+      lorePacks: [],
+      userCanonMemos: [],
+      knowledgeCards: [],
+      knowledgeInjectionEnabled: false,
+      personStateRecords: [],
+      personStateInjectionEnabled: false,
+      personPlayerName: '',
+      personBundleV01411: true,
+      storyTimelineInjectionEnabled: true,
+      storyLogReviews: [],
+      storyTimelineGuide: canonicalGuideText('timeline'),
+      storyTimelineGuideSource: 'builtin-v1.7.2',
+      storyTimelineGuideRevisionV15: true,
+      storyTimelinePendingReview: null,
+      storyLogReviewRevisionV1: true,
+      storyTimelineLastReviewedMessageId: '',
+      storyTimelineLastReviewedAt: '',
+      storyTimelineReviewSettings: { threshold:50, menuBadge:true, topNotice:true, popup:false, dateIndicator:true, monthlyFold:true, monthlyFoldMin:8 },
+      storyTimelineLastDiff: [],
+      storyTimelineBackup: null,
+      storyTimelineApiDraft: null,
+      storyTimelineApiHistory: [],
+      storyTimelineAuditHistory: [],
+      storyTimelineManualRun: null,
+      storyTimelineCarryoverTurnKeys: [],
+      storyTimelineGuideRevisionV14: true,
+      storyTimelineGuideFullRevisionV14: true,
+      autoScanLastMessageId: '',
+      autoRecallContextText: '',
+      aiSummaryLastAppliedTurnKey: '',
+      aiSummaryLastAppliedAt: '',
+      aiSummaryLastAppliedTurnKeys: { logSummary:'', currentState:'' },
+      aiSummaryLastAppliedAts: { logSummary:'', currentState:'' },
+      aiSummaryUndo: null,
+      aiSummaryDraft: null,
+      aiSummaryHistory: [],
+      aiReviewInbox: [],
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    };
+    await saveRoom(created);
+    return created;
+  }
+
+  function updateSaveStatusUi(status = state.saveStatus) {
+    state.saveStatus = status;
+    const el = state.modal?.querySelector('#rpcm-save-status');
+    if (!el) return;
+    if (status === 'saving') { rpcmClearErrorHelp(el); el.textContent = '로컬 저장 중…'; el.className = 'rpcm-save-status saving'; return; }
+    if (status === 'error') {
+      el.textContent = '로컬 저장 실패'; el.className = 'rpcm-save-status error';
+      rpcmSetErrorHelp(el, state.lastSaveError || '브라우저 로컬 저장을 완료하지 못했습니다.', '로컬 저장 실패');
+      return;
+    }
+    rpcmClearErrorHelp(el); state.lastSaveError = '';
+    const when = state.lastSavedAt ? new Date(state.lastSavedAt).toLocaleTimeString('ko-KR', { hour:'2-digit', minute:'2-digit', second:'2-digit' }) : '';
+    el.textContent = when ? `로컬 저장됨 · ${when}` : '로컬 저장됨';
+    el.className = 'rpcm-save-status saved';
+  }
+
+  function renderCarrierSyncStatusUi(room = state.currentRoom) {
+    const el = state.modal?.querySelector('#rpcm-carrier-status');
+    if (!el) return;
+    el.hidden = !room?.pending;
+    if (!room?.pending) return;
+    const sessionKey = String(room.pending.sessionStartedAt || room.pending.armedAt || room.pending.messageId || '');
+    const saved = state.carrierSyncStatuses.get(String(room.chatId));
+    const entry = saved?.sessionKey === sessionKey ? saved : { phase:'idle' };
+    const labels = { idle:'현재 주입 유지 중', queued:'현재 주입 반영 대기…', syncing:'현재 주입 반영 중…', applied:'현재 주입 반영됨', suspended:'현재 주입 복구 대기', error:'현재 주입 반영 실패' };
+    el.textContent = labels[entry.phase] || labels.idle;
+    el.className = `rpcm-carrier-status ${entry.phase}`;
+    el.title = entry.phase === 'error' ? '로컬 저장 상태와 별개로 현재 주입 갱신에 실패했습니다. 오류 표시에 마우스를 올리거나 눌러 원인과 해결 방법을 확인하세요.' : '현재 주입 중인 carrier의 반영 상태';
+    if (entry.phase === 'error') rpcmSetErrorHelp(el, entry.detail || '현재 주입 내용을 서버에 반영하거나 검증하는 과정이 실패했습니다.', '현재 주입 반영 실패', '오류 원문과 복구 상태를 확인하고 현재 내용을 백업하세요. 다른 탭의 동시 작업을 멈춘 뒤 다시 시도하며, 복구 확인 전에는 강제 덮어쓰기를 하지 마세요.');
+    else rpcmClearErrorHelp(el);
+    const arm = state.modal?.querySelector('#rpcm-arm');
+    const armLabel = arm?.querySelector('.rpcm-footer-arm-label');
+    if (armLabel) {
+      armLabel.textContent = entry.phase === 'error' ? '반영 오류' : entry.phase === 'syncing' || entry.phase === 'queued' ? '재검증 중' : room.pending.reanchorRetry ? '복구 대기' : room.pending.verified ? '주입 중' : '서버 확인 필요';
+      arm.title = `${armLabel.textContent} · 누르면 주입 해제`;
+    }
+  }
+
+  function setCarrierSyncStatusUi(room, phase) {
+    if (!room?.chatId) return 0;
+    const key = String(room.chatId);
+    const revision = (state.carrierSyncStatuses.get(key)?.revision || 0) + 1;
+    const sessionKey = String(room.pending?.sessionStartedAt || room.pending?.armedAt || room.pending?.messageId || '');
+    state.carrierSyncStatuses.set(key, { phase, revision, sessionKey });
+    if (key === String(state.currentChatId)) renderCarrierSyncStatusUi(room);
+    return revision;
+  }
+
+  function finishCarrierSyncStatusUi(room, revision, phase, error = '') {
+    const key = String(room?.chatId || '');
+    if (state.carrierSyncStatuses.get(key)?.revision !== revision) return;
+    const sessionKey = String(room.pending?.sessionStartedAt || room.pending?.armedAt || room.pending?.messageId || '');
+    state.carrierSyncStatuses.set(key, { phase, revision, sessionKey, detail:phase === 'error' ? String(error?.message || error || '') : '' });
+    if (key === String(state.currentChatId)) renderCarrierSyncStatusUi(room);
+  }
+
+  // Keep the live input element intact while typing, including Korean IME.
+  const rpcmComposingEditors = new Set();
+  function rpcmHasActiveComposition() {
+    for (const editor of rpcmComposingEditors) if (!editor.isConnected) rpcmComposingEditors.delete(editor);
+    return rpcmComposingEditors.size > 0;
+  }
+  function rpcmTextEditor(node) {
+    return !!node?.matches?.('textarea,input:not([type=checkbox]):not([type=radio]):not([type=button]):not([type=submit]):not([type=file]):not([type=hidden]),[contenteditable=true]');
+  }
+  let rpcmEditingGuardsBound = false;
+  function rpcmBindEditingGuards() {
+    if (rpcmEditingGuardsBound) return;
+    rpcmEditingGuardsBound = true;
+    const owned = node => rpcmTextEditor(node) && !!node.closest('[id^="rpcm-"],[id^="wish-rpcore-"]');
+    const flush = () => requestAnimationFrame(() => {
+      const overlay = state.modal;
+      if (!overlay?._rpcmDeferredEditorRender || rpcmHasActiveComposition()
+          || (overlay.contains(document.activeElement) && rpcmTextEditor(document.activeElement))) return;
+      overlay._rpcmDeferredEditorRender = false;
+      renderModalIfOpen();
+    });
+    document.addEventListener('compositionstart', event => {
+      if (owned(event.target)) rpcmComposingEditors.add(event.target);
+    }, true);
+    document.addEventListener('compositionend', event => {
+      if (!rpcmComposingEditors.delete(event.target)) return;
+      // The final input event follows compositionend in some browsers.
+      if (state.currentRoom && state.modal?.contains(event.target)) queueRoomAutoSave(state.currentRoom, 150);
+      flush();
+    }, true);
+    document.addEventListener('focusout', event => {
+      if (owned(event.target)) flush();
+    }, true);
+  }
+
+  function queueRoomAutoSave(room, delay = 500) {
+    invalidateAiMemoryHistory();
+    if (!room) return;
+    const key = String(room.chatId || '');
+    const previous = state.autoSaveTimers.get(key);
+    if (previous) clearTimeout(previous);
+    updateSaveStatusUi('saving');
+    const timer = setTimeout(async () => {
+      state.autoSaveTimers.delete(key);
+      if (rpcmHasActiveComposition()) { queueRoomAutoSave(room, 200); return; }
+      try { await saveRoom(room); }
+      catch (e) { state.lastSaveError=String(e?.message||e||'자동저장 실패'); updateSaveStatusUi('error'); console.warn('[🪽위시 RP Manager] 자동저장 실패', e); }
+    }, delay);
+    state.autoSaveTimers.set(key, timer);
+  }
+
+
+  // UI-only metadata stays outside room data, AI evidence, and commit hashes.
+  const rpcmNewBadgeCache = new Map();
+  let rpcmNewBadgeFrame = 0;
+  function rpcmNewBadgeState(room) {
+    const id=String(room?.chatId||'');
+    if(!rpcmNewBadgeCache.has(id)){
+      let saved;try{saved=JSON.parse(localStorage.getItem('RPCM_new_items_v1:'+id)||'null');}catch(_){}
+      rpcmNewBadgeCache.set(id,{clock:Number(saved?.clock)||0,lastTime:Number(saved?.lastTime)||0,seen:Array.isArray(saved?.seen)?saved.seen.slice(-64):[],items:saved?.items&&typeof saved.items==='object'?saved.items:{},inventory:Array.isArray(saved?.inventory)?saved.inventory:null});
+    }
+    return rpcmNewBadgeCache.get(id);
+  }
+  function rpcmNewBadgePersist(room,meta) {
+    try{localStorage.setItem('RPCM_new_items_v1:'+String(room.chatId),JSON.stringify(meta));}catch(_){}
+    rpcmNewBadgeSchedule();
+  }
+  function rpcmNewBadgeStamp(room,keys) {
+    if(!room?.chatId||!keys.length)return;
+    const meta=rpcmNewBadgeState(room);let changed=false;
+    for(const key of keys)if(key&&!Object.hasOwn(meta.items,key)){meta.items[key]=meta.clock;changed=true;}
+    if(changed)rpcmNewBadgePersist(room,meta);
+  }
+  function rpcmNewBadgeEntityKeys(room) {
+    const keys=new Set(),add=(type,rows,id='id')=>{for(const row of rows||[])if(row?.[id])keys.add(type+':'+String(row[id]));};
+    add('slot',room.slots);add('knowledge',room.knowledgeCards);add('person',room.personStateRecords);add('timeline',room.storyTimelineCards,'cardId');add('memo',room.userCanonMemos);
+    const actor=name=>{if(String(name||'').trim())keys.add('actor:'+String(name).trim());};
+    for(const row of room.personUiActors||[])actor(row.name);
+    for(const row of room.slots||[])if(row.group==='character')actor(row.title);
+    for(const row of room.knowledgeCards||[])actor(row.person);
+    for(const row of room.personStateRecords||[]){actor(row.person);actor(row.target);}
+    for(const pack of room.lorePacks||[]){if(pack.id)keys.add('pack:'+pack.id);for(const card of pack.cards||[])if(card.id)keys.add('lore:'+pack.id+':'+card.id);}
+    const log=(room.slots||[]).find(slot=>slot.id==='logSummary');
+    for(const block of parseDatedLogBlocks(log?.content||''))keys.add('log:'+block.key);
+    return keys;
+  }
+  function rpcmNewBadgeCommitted(room,before,writer='') {
+    // Initial room creation, migrations, undo, and backup restoration are not new updates.
+    if(!before?.chatId||/migrat|restor|undo|rollback/i.test(writer))return;
+    const previous=rpcmNewBadgeEntityKeys(before),next=rpcmNewBadgeEntityKeys(room);
+    rpcmNewBadgeStamp(room,[...next].filter(key=>!previous.has(key)));
+    for(const slot of room.slots||[])if(String(slot.content||'').trim()&&!String((before.slots||[]).find(row=>row.id===slot.id)?.content||'').trim())rpcmNewBadgeStamp(room,['slot:'+slot.id]);
+  }
+  function rpcmNewBadgeInventory(room,inventory) {
+    const meta=rpcmNewBadgeState(room),ids=inventory.map(longTermId).filter(Boolean);
+    if(meta.inventory){const old=new Set(meta.inventory);rpcmNewBadgeStamp(room,ids.filter(id=>!old.has(id)).map(id=>'longterm:'+id));}
+    if(JSON.stringify(meta.inventory)!==JSON.stringify(ids)){meta.inventory=ids;rpcmNewBadgePersist(room,meta);}
+  }
+  function rpcmNewBadgeObserveMessages(chatId,messages,chronological=false) {
+    const room=state.currentRoom;if(!room||String(apiChatIdOf(room))!==String(chatId))return;
+    const ordered=chronological?messages:[...messages].reverse(),assistantToUser=new Map(),times=new Map();let userId='';
+    for(const message of ordered){const role=messageRoleOf(message);if(role==='user'){userId=String(messageIdOf(message)||message.turnId||'');const time=Date.parse(message.createdAt||message.created_at||'')||(/^[0-9a-f]{24}$/i.test(userId)?parseInt(userId.slice(0,8),16)*1000:0);times.set(userId,time);}else if(userId&&['assistant','character','bot'].includes(role))assistantToUser.set(String(messageIdOf(message)||''),userId);}
+    const keys=[...new Set(buildCompletedAiDialogueTurns(ordered).map(turn=>assistantToUser.get(turn.reviewSources?.[0]?.id)||String(turn.key)))];
+    if(!keys.length)return;
+    const meta=rpcmNewBadgeState(room);
+    if(!meta.seen.length){meta.seen=keys.slice(-64);meta.lastTime=times.get(keys.at(-1))||0;rpcmNewBadgePersist(room,meta);return;}
+    const anchor=keys.lastIndexOf(meta.seen.at(-1));
+    // Older/out-of-order pages cannot advance the clock. Re-edits and rerolls share a user ID.
+    const seen=new Set(meta.seen),fresh=(anchor>=0?keys.slice(anchor+1):meta.lastTime?keys.filter(key=>(times.get(key)||0)>meta.lastTime):[]).filter(key=>!seen.has(key));
+    if(!fresh.length)return;
+    meta.clock+=fresh.length;meta.seen=[...meta.seen,...fresh].slice(-64);
+    meta.lastTime=Math.max(meta.lastTime,...fresh.map(key=>times.get(key)||0));
+    for(const [key,born] of Object.entries(meta.items))if(meta.clock-born>100)delete meta.items[key];
+    rpcmNewBadgePersist(room,meta);
+  }
+  function rpcmNewBadgeRemaining(room,key) {
+    const meta=rpcmNewBadgeState(room);return Object.hasOwn(meta.items,key)?Math.max(0,5-(meta.clock-meta.items[key])):0;
+  }
+  function rpcmNewBadgeSchedule() {
+    if(rpcmNewBadgeFrame)return;
+    rpcmNewBadgeFrame=requestAnimationFrame(()=>{rpcmNewBadgeFrame=0;rpcmNewBadgePaint();});
+  }
+  function rpcmNewBadgePaint() {
+    const room=state.currentRoom;if(!room)return;
+    const specs=[
+      ['.rpcm-slot[data-slot-id]','slot','slotId','summary .rpcm-slot-title,summary strong,summary .rpcm-slot-name'],
+      ['.rpcm-knowledge-card[data-knowledge-id]','knowledge','knowledgeId','summary strong'],
+      ['.rpcm-person-record[data-person-record]','person','personRecord','summary strong'],
+      ['.m3-panel[data-new-knowledge-ids]','knowledge-set','newKnowledgeIds','.m3-row b'],
+      ['.m3-panel[data-new-person-id]','person','newPersonId','.m3-row b'],
+      ['.m3-who[data-new-actor]','actor','newActor','.m3-person-open b'],
+      ['.rpcm-profile[data-person-name]','actor','personName','summary strong'],
+      ['.rpcm-user-memo-card[data-memo-id]','memo','memoId','.rpcm-user-memo-row strong'],
+      ['[data-inline-story-id]','timeline','inlineStoryId','summary strong'],
+      ['.rpcm-story-card[data-story-card-id]','timeline','storyCardId','.rpcm-story-card-top'],
+      ['.rpcm-lore-pack[data-lore-pack]','pack','lorePack','summary strong'],
+      ['.rpcm-lore-card[data-lore-card]','lore','loreCard','summary strong'],
+      ['.rpcm-ltm-memory[data-ltm-card-id]','longterm','ltmCardId','label strong'],
+      ['.rpcm-log-row[data-log-key],.rpcm-detached-log-card[data-log-key]','log','logKey','.rpcm-log-row-head strong,summary strong,h3,strong'],
+    ];
+    for(const [selector,type,attr,heading] of specs)for(const node of document.querySelectorAll(selector)){
+      const surface=node.closest('[data-room-id]');if(surface&&surface.dataset.roomId!==String(room.chatId))continue;
+      let key=type+':'+(type==='lore'?(node.closest('[data-lore-pack]')?.dataset.lorePack||'')+':':'')+node.dataset[attr];
+      if(type==='knowledge-set'){const ids=JSON.parse(node.dataset[attr]||'[]');key=ids.map(id=>'knowledge:'+id).find(id=>rpcmNewBadgeRemaining(room,id)>0)||'knowledge-set:expired';for(const old of node.querySelectorAll('[data-rpcm-new-key]'))if(old.dataset.rpcmNewKey!==key)old.remove();}
+      const remaining=rpcmNewBadgeRemaining(room,key),existing=node.querySelector('[data-rpcm-new-key="'+CSS.escape(key)+'"]');
+      if(!remaining){existing?.remove();continue;}
+      const target=node.querySelector(heading);if(!target)continue;
+      const badge=existing||document.createElement('span');badge.className='rpcm-new-badge';badge.dataset.rpcmNewKey=key;badge.textContent='NEW';badge.title='새로 추가됨 · 완료 RP '+remaining+'턴 뒤 표시 종료';badge.setAttribute('aria-label',badge.title);
+      if(!existing)target.insertAdjacentElement('afterend',badge);
+    }
+  }
+
+  // Separate from site IndexedDB: best-effort userscript-manager recovery copies.
+  // Never includes API credentials (they live in separate authentication settings).
+  const rescueRuntime={queue:Promise.resolve(),error:'',seeded:false,pending:new Map(),timer:null};
+  function rescueKey(kind,id=''){return `RPCM_RESCUE_V1:${location.origin}:${kind}:${id}`;}
+  function rescueUseful(kind,value){return kind==='library'?!!value?.scopeId&&((value.characters||[]).length||(value.extras||[]).length):!!value?.chatId&&((value.slots||[]).some(s=>String(s.content||'').trim())||(value.knowledgeCards||[]).length||(value.personStateRecords||[]).length||(value.storyTimelineCards||[]).length||(value.lorePacks||[]).length||(value.userCanonMemos||[]).length);}
+  function rescueCopy(value){const copy=structuredClone(value);copy.pending=null;for(const key of ['fullRebuildJob','manualIntegratedJob','manualPendingJobs','manualFullBuild','compressionJob','compressionDraft','storyTimelineApiDraft'])delete copy[key];return copy;}
+  async function rescueStore(kind,value){
+    if(!rescueUseful(kind,value))return;const id=String(kind==='room'?value.chatId:value.scopeId),data=rescueCopy(value),hash=await longTermHash(JSON.stringify(data));
+    const key=rescueKey(kind,id),previous=await GM_getValue(key,null);let prior=null;try{prior=typeof previous==='string'?JSON.parse(previous):previous;}catch(_){}
+    const content=copy=>{const data=structuredClone(copy);for(const key of ['_rpcmRevision','updatedAt','manualApplyReceipts','aiApiUsage','notifications','noticeCenter','lastNewBadgeRefresh','rpcmNewEntries','aiMemoryAutomation'])delete data[key];return JSON.stringify(data);};
+    if(prior?.hash===hash||prior?.data&&content(prior.data)===content(data))return;
+    const envelope={format:'RPCM_RESCUE_V1',origin:location.origin,kind,id,at:nowIso(),hash,data};const serialized=JSON.stringify(envelope);
+    await GM_setValue(key,serialized);if(await GM_getValue(key,null)!==serialized)throw new Error('비상 보관본 저장 확인 실패');
+    // Keep one previous content snapshot per entry, not hundreds of autosave versions.
+    if(prior?.format==='RPCM_RESCUE_V1'&&prior.origin===location.origin&&prior.hash!==hash)await GM_setValue(rescueKey('previous-'+kind,id),JSON.stringify(prior));
+    let entries=[];try{entries=JSON.parse(await GM_getValue(rescueKey('index'),'[]'));}catch(_){}
+    entries=entries.filter(row=>!(row.kind===kind&&row.id===id));entries.push({kind,id,at:envelope.at,label:String(value.label||value.title||value.name||id)});
+    await GM_setValue(rescueKey('index'),JSON.stringify(entries));rescueRuntime.error='';
+  }
+  function flushRescueCopies(){
+    clearTimeout(rescueRuntime.timer);rescueRuntime.timer=null;
+    const entries=[...rescueRuntime.pending.values()];rescueRuntime.pending.clear();
+    rescueRuntime.queue=rescueRuntime.queue.catch(()=>{}).then(async()=>{
+      for(const {kind,id} of entries){try{const stored=kind==='room'?await readManualStoredRoom({chatId:id}):await getCharacterLibrary(id);if(stored)await rescueStore(kind,stored);}catch(error){rescueRuntime.error=String(error.message||error);}}
+    });return rescueRuntime.queue;
+  }
+  function queueRescueCopy(kind,value){
+    if(!rescueUseful(kind,value))return;
+    const id=String(kind==='room'?value.chatId:value.scopeId);rescueRuntime.pending.set(kind+':'+id,{kind,id});
+    clearTimeout(rescueRuntime.timer);rescueRuntime.timer=setTimeout(flushRescueCopies,500);
+  }
+  async function seedRescueCopies(){
+    if(rescueRuntime.seeded)return;rescueRuntime.seeded=true;
+    try{const [rooms,libraries]=await Promise.all([getAllRooms(),getAllCharacterLibraries()]);rescueRuntime.queue=rescueRuntime.queue.catch(()=>{}).then(async()=>{for(const room of rooms)await rescueStore('room',room);for(const library of libraries)await rescueStore('library',library);}).catch(error=>{rescueRuntime.error=String(error.message||error);});
+      let index=[];try{index=JSON.parse(await GM_getValue(rescueKey('index'),'[]'));}catch(_){}
+      const missing=index.filter(row=>!row.deletedAt&&(row.kind==='room'?!rooms.some(room=>String(room.chatId)===row.id):!libraries.some(lib=>String(lib.scopeId)===row.id)));
+      if(missing.length)notify(`사이트 저장소에서 찾지 못한 비상 보관본 ${missing.length}개가 있습니다. 자료 관리 → 도구·복사·백업·복원 → 저장소 점검·복구에서 확인하세요.`,'warn',10000);}catch(error){rescueRuntime.error=error.message;}
+  }
+  async function rescueMarkDeleted(kind,id){
+    await flushRescueCopies();
+    rescueRuntime.queue=rescueRuntime.queue.catch(()=>{}).then(async()=>{let rows=[];try{rows=JSON.parse(await GM_getValue(rescueKey('index'),'[]'));}catch(_){}for(const row of rows)if(row.kind===kind&&row.id===String(id))row.deletedAt=nowIso();await GM_setValue(rescueKey('index'),JSON.stringify(rows));}).catch(error=>{rescueRuntime.error=error.message;});
+    await rescueRuntime.queue;
+  }
+  async function rescuePayload(previous=false){
+    await flushRescueCopies();let entries=[];try{entries=JSON.parse(await GM_getValue(rescueKey('index'),'[]'));}catch(_){}
+    const rooms=[],characterLibraries=[],errors=[];
+    for(const row of entries){try{let raw=await GM_getValue(rescueKey((previous?'previous-':'')+row.kind,row.id),null);if(!raw&&previous)raw=await GM_getValue(rescueKey(row.kind,row.id),null);if(!raw)continue;const entry=typeof raw==='string'?JSON.parse(raw):raw;
+      if(entry.format!=='RPCM_RESCUE_V1'||entry.origin!==location.origin||entry.kind!==row.kind||entry.id!==row.id||entry.hash!==await longTermHash(JSON.stringify(entry.data)))throw new Error('보관본 무결성 확인 실패');
+      if(row.kind==='room'&&String(entry.data.chatId)===row.id)rooms.push(entry.data);else if(row.kind==='library'&&String(entry.data.scopeId)===row.id)characterLibraries.push(entry.data);else throw new Error('식별자 불일치');
+    }catch(error){errors.push(row.label+': '+error.message);}}
+    return {_rpContextManagerBackup:true,version:APP.version,exportedAt:nowIso(),rooms,characterLibraries,errors};
+  }
+  async function restoreRescueSelection(){
+    const data=await rescuePayload(),[rooms,libraries]=await Promise.all([getAllRooms(),getAllCharacterLibraries()]);
+    if(!data.rooms.length&&!data.characterLibraries.length)throw new Error('복구 가능한 비상 보관본이 없습니다. 다른 브라우저·프로필·사이트 주소인지 확인하세요.');
+    const choice=await openBackupImportDialog(data,rooms,libraries);if(!choice)return;
+    if(choice.mode==='clone-current')throw new Error('비상 복구는 원래 방으로 복원하는 모드를 선택하세요. 다른 방 복사는 백업 JSON 불러오기를 사용하세요.');
+    // Preserve a downloadable pre-restore copy, including existing libraries.
+    downloadText(JSON.stringify({_rpContextManagerBackup:true,version:APP.version,exportedAt:nowIso(),rooms,characterLibraries:libraries},null,2),'RP_비상복구_적용전_백업.json');
+    for(const id of choice.roomIds){const source=data.rooms.find(r=>String(r.chatId)===String(id));if(!source)continue;const room=structuredClone(source);room.pending=null;room._rpcmRevision=Number(rooms.find(r=>String(r.chatId)===String(id))?._rpcmRevision||0);await saveRestoredRoom(room);}
+    for(const id of choice.libraryIds){const lib=data.characterLibraries.find(l=>String(l.scopeId)===String(id));if(lib)await saveCharacterLibrary(structuredClone(lib));}
+    await ensureCurrentRoom(getChatIdFromPath(),true);renderModalIfOpen();notify('선택한 방·설정집 비상 복구 완료','success');
+  }
+  function openStorageRecovery(){
+    document.querySelector('#rpcm-full-rebuild-dialog')?.remove();const backdrop=document.createElement('div');backdrop.id='rpcm-full-rebuild-dialog';
+    backdrop.innerHTML=`<section class="rpcm-update-dialog rpcm-full-rebuild-dialog rpcm-storage-dialog" role="dialog" aria-modal="true" aria-label="저장소 점검·복구"><header><div><h2>저장소 점검·복구</h2></div><button class="rpcm-update-dialog-close" aria-label="닫기">${rpcmUiIcon('close')}</button></header><div class="rpcm-update-result-body"><p>RP와 설정집은 이 브라우저의 사이트 저장소에 저장됩니다. 같은 브라우저·프로필·사이트 주소인지 먼저 확인하세요. 시크릿 모드, 사이트 데이터 삭제·브라우저 저장소 정리로 자료가 사라질 수 있습니다.</p><p>비상 보관본은 사용자 스크립트 관리자의 별도 저장공간에 최근 내용과 직전 내용을 보관합니다. 사이트 데이터가 없어져도 확인할 수 있지만, 브라우저 프로필·확장 프로그램 데이터까지 삭제되면 복구할 수 없습니다. 기기 밖에 보관할 전체 백업 JSON도 주기적으로 받아두세요.</p><p data-storage-status role="status">저장소 확인 중…</p><div class="rpcm-update-actions"><button class="rpcm-btn secondary" data-storage-persist>자료 보존 요청</button><button class="rpcm-btn secondary" data-storage-export>비상 보관본 JSON 받기</button><button class="rpcm-btn secondary" data-storage-previous>직전 보관본 JSON 받기</button><button class="rpcm-btn primary" data-storage-restore>복구할 자료 선택</button></div></div><footer><button class="rpcm-btn secondary rpcm-update-dialog-close">닫기</button></footer></section>`;
+    const status=backdrop.querySelector('[data-storage-status]');const refresh=async()=>{try{await seedRescueCopies();const [data,rooms,libs,persisted,estimate]=await Promise.all([rescuePayload(),getAllRooms(),getAllCharacterLibraries(),navigator.storage?.persisted?.(),navigator.storage?.estimate?.()]);status.textContent=`현재 RP ${rooms.length}개 · 설정집 ${libs.length}개 / 비상 RP ${data.rooms.length}개 · 설정집 ${data.characterLibraries.length}개 · 브라우저 보존 ${persisted?'승인됨':'미승인'}${estimate?.usage?` · 사이트 사용량 ${Math.round(estimate.usage/1024/1024)}MB`:''}${data.errors.length?' · 무결성 오류 '+data.errors.length+'개':''}${rescueRuntime.error?' · 비상 저장 실패: '+rescueRuntime.error:''}`;}catch(error){status.textContent='저장소 확인 실패: '+error.message;}};
+    backdrop.querySelector('[data-storage-persist]').onclick=async()=>{try{if(!navigator.storage?.persist)throw new Error('이 브라우저에서 지원하지 않습니다.');const allowed=await navigator.storage.persist();await refresh();if(!allowed)status.textContent+=' · 보존 요청을 브라우저가 승인하지 않았습니다.';}catch(error){status.textContent=error.message;}};
+    for(const [attr,prior] of [['export',false],['previous',true]])backdrop.querySelector(`[data-storage-${attr}]`).onclick=async()=>{try{const data=await rescuePayload(prior);downloadText(JSON.stringify(data,null,2),`RP_비상보관본_${prior?'직전':'최근'}.json`);await refresh();}catch(error){status.textContent=error.message;}};
+    backdrop.querySelector('[data-storage-restore]').onclick=async event=>{const button=event.currentTarget;button.disabled=true;backdrop.style.visibility='hidden';try{await restoreRescueSelection();await refresh();}catch(error){status.textContent='복구 실패: '+error.message;}finally{backdrop.style.visibility='';button.disabled=false;}};
+    const close=()=>backdrop.remove();backdrop.querySelectorAll('.rpcm-update-dialog-close').forEach(b=>b.onclick=close);backdrop.onclick=e=>{if(e.target===backdrop)close();};backdrop.onkeydown=e=>{if(e.key==='Escape')close();};document.body.append(backdrop);void refresh();
+  }
+
+  function traceRoomWrite(room,writer,status,expectedRevision,actualRevision,hash='',details={}) {
+    if(status==='committed'||status==='readback-verified'){try{rpcmNewBadgeCommitted(room,details.before,writer);queueRescueCopy('room',room);}catch(_){}}
+    try {
+      const key='RPCM_room_write_trace_v1',rows=JSON.parse(localStorage.getItem(key)||'[]'),at=nowIso();
+      const before=details.before,after=details.after||room;
+      const changedKeys=before?Array.from(new Set([...Object.keys(before),...Object.keys(after||{})])).filter(key=>JSON.stringify(before[key])!==JSON.stringify(after?.[key])):[];
+      rows.push({at,roomId:String(room?.chatId||''),writer,status,expectedRevision,actualRevision,beforeRevision:expectedRevision,afterRevision:actualRevision,startedAt:details.startedAt||at,committedAt:status==='committed'||status==='readback-verified'?at:null,changedKeys,staleRejected:status==='stale-rejected',hash:String(hash||'')});
+      localStorage.setItem(key,JSON.stringify(rows.slice(-200)));
+    } catch (_) {}
+  }
+
+  function rpcmRoomClone(value){return value===undefined?undefined:structuredClone(value);}
+  function rpcmRoomSig(has,value){if(!has)return '__RPCM_MISSING__';try{return JSON.stringify(value);}catch(_){return String(value);}}
+  function rpcmRoomPlain(value){return !!value&&typeof value==='object'&&!Array.isArray(value)&&Object.getPrototypeOf(value)===Object.prototype;}
+  function rpcmRoomArrayKey(rows){
+    if(!rows.every(row=>row&&typeof row==='object'&&!Array.isArray(row)))return '';
+    for(const key of ['id','cardId','slotId','jobId','key','ref']){
+      const values=rows.map(row=>row?.[key]).filter(value=>value!==undefined&&value!==null&&String(value)!=='').map(String);
+      if(values.length===rows.length&&new Set(values).size===values.length)return key;
+    }
+    return '';
+  }
+  function rpcmThreeWayNode(baseHas,base,localHas,local,remoteHas,remote,path,conflicts){
+    const b=rpcmRoomSig(baseHas,base),l=rpcmRoomSig(localHas,local),r=rpcmRoomSig(remoteHas,remote);
+    if(l===b)return remoteHas?{has:true,value:rpcmRoomClone(remote)}:{has:false};
+    if(r===b)return localHas?{has:true,value:rpcmRoomClone(local)}:{has:false};
+    if(l===r)return localHas?{has:true,value:rpcmRoomClone(local)}:{has:false};
+    if((baseHas?rpcmRoomPlain(base):true)&&(localHas?rpcmRoomPlain(local):true)&&(remoteHas?rpcmRoomPlain(remote):true)){
+      const out={},baseObj=baseHas?base:{},localObj=localHas?local:{},remoteObj=remoteHas?remote:{};
+      const keys=new Set([...Object.keys(baseObj),...Object.keys(localObj),...Object.keys(remoteObj)]);
+      for(const key of keys){
+        if(!path&&['_rpcmRevision','updatedAt'].includes(key)){if(Object.hasOwn(remoteObj,key))out[key]=rpcmRoomClone(remoteObj[key]);continue;}
+        const child=rpcmThreeWayNode(Object.hasOwn(baseObj,key),baseObj[key],Object.hasOwn(localObj,key),localObj[key],Object.hasOwn(remoteObj,key),remoteObj[key],path?`${path}.${key}`:key,conflicts);
+        if(child.has)out[key]=child.value;
+      }
+      return {has:true,value:out};
+    }
+    if(baseHas&&localHas&&remoteHas&&Array.isArray(base)&&Array.isArray(local)&&Array.isArray(remote)){
+      const all=[...base,...local,...remote],key=rpcmRoomArrayKey(all);
+      if(key){
+        const bm=new Map(base.map(row=>[String(row[key]),row])),lm=new Map(local.map(row=>[String(row[key]),row])),rm=new Map(remote.map(row=>[String(row[key]),row]));
+        const order=[...remote.map(row=>String(row[key])),...local.map(row=>String(row[key])).filter(id=>!rm.has(id))],out=[];
+        for(const id of order){
+          const child=rpcmThreeWayNode(bm.has(id),bm.get(id),lm.has(id),lm.get(id),rm.has(id),rm.get(id),`${path}[${key}=${id}]`,conflicts);
+          if(child.has)out.push(child.value);
+        }
+        return {has:true,value:out};
+      }
+    }
+    conflicts.push(path||'(root)');
+    return remoteHas?{has:true,value:rpcmRoomClone(remote)}:{has:false};
+  }
+  function rpcmRememberRoomBaseline(room){
+    if(!room?.chatId)return;
+    state.roomSaveBaselines ||= new Map();
+    state.roomSaveBaselines.set(String(room.chatId),{revision:Number(room._rpcmRevision||0),snapshot:rpcmRoomClone(room)});
+  }
+  function rpcmRebaseRoomOntoStored(room,stored){
+    const key=String(room?.chatId||''),entry=state.roomSaveBaselines?.get(key),priorRevision=Number(room?._rpcmRevision||0);
+    if(!entry||entry.revision!==priorRevision)return {ok:false,reason:'기준 저장본이 없어 자동 병합할 수 없습니다.',conflicts:[]};
+    const conflicts=[],merged=rpcmThreeWayNode(true,entry.snapshot,true,room,true,stored,'',conflicts).value;
+    if(conflicts.length)return {ok:false,reason:`동시에 수정된 항목이 있습니다: ${conflicts.slice(0,4).join(', ')}${conflicts.length>4?' 외':''}`,conflicts};
+    return {ok:true,room:merged,conflicts:[]};
+  }
+  function rpcmReplaceRoomObject(target,source){
+    for(const key of Object.keys(target))if(!Object.hasOwn(source,key))delete target[key];
+    const next=rpcmRoomClone(source);
+    // Open editors retain card references. Keep them across commits.
+    for (const field of ['slots','knowledgeCards','personStateRecords']) {
+      const previous = new Map((target[field] || []).map(row => [String(row.id), row]));
+      if (!Array.isArray(next[field])) continue;
+      next[field] = next[field].map(row => {
+        const existing = previous.get(String(row.id));
+        if (!existing) return row;
+        for (const key of Object.keys(existing)) if (!Object.hasOwn(row, key)) delete existing[key];
+        Object.assign(existing, row);
+        return existing;
+      });
+    }
+    if(rpcmRoomPlain(target.longTermMemory)&&rpcmRoomPlain(next.longTermMemory))next.longTermMemory=longTermReconcileObject(target.longTermMemory,next.longTermMemory);
+    Object.assign(target,next);
+    return target;
+  }
+
+  function rpcmKeepLateEdits(before,live,stored){
+    if(rpcmRoomSig(true,before)===rpcmRoomSig(true,live))return rpcmRoomClone(stored);
+    if(rpcmRoomPlain(before)&&rpcmRoomPlain(live)&&rpcmRoomPlain(stored)){
+      const out=rpcmRoomClone(stored);
+      for(const key of new Set([...Object.keys(before),...Object.keys(live)])){
+        if(['_rpcmRevision','updatedAt'].includes(key))continue;
+        const bh=Object.hasOwn(before,key),lh=Object.hasOwn(live,key);
+        if(rpcmRoomSig(bh,before[key])===rpcmRoomSig(lh,live[key]))continue;
+        if(!lh)delete out[key];else out[key]=bh&&Object.hasOwn(stored,key)?rpcmKeepLateEdits(before[key],live[key],stored[key]):rpcmRoomClone(live[key]);
+      }
+      return out;
+    }
+    if(Array.isArray(before)&&Array.isArray(live)&&Array.isArray(stored)){
+      const key=rpcmRoomArrayKey(before)||rpcmRoomArrayKey(live)||rpcmRoomArrayKey(stored);
+      if(key&&[before,live,stored].every(rows=>!rows.length||rpcmRoomArrayKey(rows)===key)){
+        const bm=new Map(before.map(row=>[String(row[key]),row])),lm=new Map(live.map(row=>[String(row[key]),row]));
+        const out=stored.filter(row=>!bm.has(String(row[key]))||lm.has(String(row[key]))).map(row=>{
+          const id=String(row[key]);return bm.has(id)&&lm.has(id)?rpcmKeepLateEdits(bm.get(id),lm.get(id),row):row;
+        });
+        const ids=new Set(out.map(row=>String(row[key])));
+        for(const row of live)if(!bm.has(String(row[key]))&&!ids.has(String(row[key])))out.push(rpcmRoomClone(row));
+        return out;
+      }
+    }
+    return rpcmRoomClone(live);
+  }
+
+  async function saveRoom(room,writer='saveRoom',validateBeforeWrite=null) {
+    if(writer==='saveRoom')writer=String(new Error().stack?.split('\n')[2]?.match(/at ([^ (]+)/)?.[1]||writer);
+    const key=String(room.chatId||'');
+    state.roomSaveQueues ||= new Map();
+    const previous=state.roomSaveQueues.get(key)||Promise.resolve();
+    const run=previous.catch(()=>{}).then(async()=>{
+      const manualCommitLock=manualUpdateRuntime.commitLocks.get(key);
+      if(manualCommitLock)await manualCommitLock;
+      const stampedEdits=await stampManualExplicitEdits(room);
+      let committedRoom=null,writtenLocal=null,storedForTrace=null,staleReason='';
+      const priorRevision=Number(room._rpcmRevision||0),priorSnapshot=rpcmRoomClone(room),startedAt=nowIso();
+      await new Promise((resolve,reject)=>{
+        const tx=state.db.transaction(APP.storeName,'readwrite'),store=tx.objectStore(APP.storeName),get=store.get(room.chatId);
+        let abortedForStale=false,validationError=null;
+        get.onsuccess=()=>{
+          const stored=get.result;storedForTrace=stored||{};
+          const revision=Number(stored?._rpcmRevision||0);
+          let candidate=rpcmRoomClone(room);writtenLocal=rpcmRoomClone(candidate);
+          if(stored&&rescueUseful('room',stored)&&!rescueUseful('room',candidate)&&!state.roomSaveBaselines?.has(key)&&writer!=='backup-restore'){staleReason='빈 초기 데이터로 기존 기억을 덮어쓰려는 저장을 차단했습니다.';abortedForStale=true;tx.abort();return;}
+          if(priorRevision!==revision){
+            if(!stored){staleReason='저장본이 사라져 자동 병합할 수 없습니다.';abortedForStale=true;tx.abort();return;}
+            const rebased=rpcmRebaseRoomOntoStored(room,stored);
+            if(!rebased.ok){staleReason=rebased.reason;traceRoomWrite(room,writer,'stale-rejected',priorRevision,revision,'',{startedAt,before:stored,after:room});abortedForStale=true;tx.abort();return;}
+            candidate=rebased.room;
+            traceRoomWrite(candidate,writer,'stale-rebased',priorRevision,revision,'',{startedAt,before:stored,after:candidate});
+          }
+          try { if (validateBeforeWrite) validateBeforeWrite(candidate); }
+          catch (error) { validationError=error;tx.abort();return; }
+          candidate._rpcmRevision=revision+1;candidate.updatedAt=nowIso();committedRoom=candidate;store.put(candidate);
+        };
+        get.onerror=()=>tx.abort();
+        tx.oncomplete=()=>resolve();
+        tx.onabort=()=>reject(validationError || new Error(abortedForStale?`최신 저장본과 자동 병합하지 못했습니다. ${staleReason} 다른 탭에서 같은 항목을 수정했다면 최신 화면을 다시 열어 주세요.`:`IndexedDB 저장이 취소됐습니다.${tx.error?.name?` (${tx.error.name}: ${tx.error.message||''})`:''}`));
+        tx.onerror=()=>{const error=tx.error||new Error('IndexedDB 저장 실패');const name=String(error?.name||'').toLowerCase(),message=String(error?.message||error||'');reject(/quota/.test(name+' '+message.toLowerCase())?new Error(`브라우저 IndexedDB 저장공간 한도를 초과했습니다. RP Manager 데이터가 너무 커졌거나 브라우저가 이 사이트 저장공간을 제한하고 있습니다. (${message||error.name})`):error);};
+      });
+      if(!committedRoom)throw new Error('저장 결과를 만들지 못했습니다.');
+      rpcmReplaceRoomObject(room,rpcmKeepLateEdits(writtenLocal,room,committedRoom));rpcmRememberRoomBaseline(committedRoom);
+      try{queueSemanticIndexRefresh(room,'saved');}catch(error){console.warn('[Wish semantic] index scheduling',error);}
+      traceRoomWrite(room,writer,'committed',priorRevision,room._rpcmRevision,'',{startedAt,before:storedForTrace||{},after:room});
+      const editTasks=manualExplicitEdits.get(key);for(const [task,version] of stampedEdits)if(editTasks?.get(task)===version)editTasks.delete(task);
+      if(room.chatId===state.currentChatId){state.lastSavedAt=Date.now();updateSaveStatusUi('saved');}
+    });
+    state.roomSaveQueues.set(key,run);
+    try{return await run;}finally{if(state.roomSaveQueues.get(key)===run)state.roomSaveQueues.delete(key);}
+  }
+
+  async function getAllRooms() {
+    return new Promise((resolve, reject) => {
+      const tx = state.db.transaction(APP.storeName, 'readonly');
+      const req = tx.objectStore(APP.storeName).getAll();
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function clearCurrentRoom(chatId) {
+    await new Promise((resolve, reject) => {
+      const tx = state.db.transaction(APP.storeName, 'readwrite');
+      const req = tx.objectStore(APP.storeName).delete(chatId);
+      req.onerror = () => tx.abort();
+      tx.oncomplete = () => resolve();
+      tx.onabort = () => reject(tx.error || new Error('현재 방 삭제 취소'));
+      tx.onerror = () => reject(tx.error || new Error('현재 방 삭제 실패'));
+    });
+    await rescueMarkDeleted('room',chatId);
+  }
+
+  async function getCharacterLibrary(scopeId) {
+    if (!scopeId) return null;
+    return new Promise((resolve, reject) => {
+      const tx = state.db.transaction(APP.libraryStoreName, 'readonly');
+      const req = tx.objectStore(APP.libraryStoreName).get(scopeId);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function saveCharacterLibrary(library) {
+    if (!library?.scopeId) throw new Error('설정집 식별자를 찾지 못했습니다.');
+    library.updatedAt = nowIso();
+    await new Promise((resolve, reject) => {
+      const tx = state.db.transaction(APP.libraryStoreName, 'readwrite');
+      const req = tx.objectStore(APP.libraryStoreName).put(library);
+      req.onerror = () => tx.abort();
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error || new Error('설정집 저장 실패'));
+      tx.onabort = () => reject(tx.error || new Error('설정집 저장 취소 · 저장 완료되지 않았습니다.'));
+    });
+    const stored=await getCharacterLibrary(library.scopeId);
+    if(JSON.stringify(stored)!==JSON.stringify(library))throw new Error('설정집 저장 후 실제 저장본 확인 실패');
+    queueRescueCopy('library',stored);
+  }
+
+  async function deleteStoredLibrary(scopeId) {
+    const id = String(scopeId || '');
+    if (!id) throw new Error('삭제할 설정집 식별자를 찾지 못했습니다.');
+    await new Promise((resolve, reject) => {
+      const tx = state.db.transaction(APP.libraryStoreName, 'readwrite');
+      const req = tx.objectStore(APP.libraryStoreName).delete(id);
+      req.onerror = () => tx.abort();
+      tx.oncomplete = () => resolve();
+      tx.onabort = () => reject(tx.error || new Error('설정집 삭제 취소'));
+      tx.onerror = () => reject(tx.error || new Error('설정집 삭제 실패'));
+    });
+
+    await rescueMarkDeleted('library',id);
+    // 삭제된 설정집을 가리키는 방별 선택값도 정리합니다.
+    const rooms = await getAllRooms();
+    for (const room of rooms) {
+      let changed = false;
+      if (String(room.autoCharacterLibraryId || '') === id) { room.autoCharacterLibraryId = ''; changed = true; }
+      if (String(room.lastCharacterLibraryId || '') === id) { room.lastCharacterLibraryId = ''; changed = true; }
+      if (String(room.lastExtraLibraryId || '') === id) { room.lastExtraLibraryId = ''; changed = true; }
+      if (changed) await saveRoom(room);
+    }
+    if (state.currentRoom) {
+      if (String(state.currentRoom.autoCharacterLibraryId || '') === id) state.currentRoom.autoCharacterLibraryId = '';
+      if (String(state.currentRoom.lastCharacterLibraryId || '') === id) state.currentRoom.lastCharacterLibraryId = '';
+      if (String(state.currentRoom.lastExtraLibraryId || '') === id) state.currentRoom.lastExtraLibraryId = '';
+    }
+    try { document.querySelector(`#rpcm-auto-char-library option[value="${CSS.escape(id)}"]`)?.remove(); } catch (_) {}
+  }
+
+  async function getAllCharacterLibraries() {
+    return new Promise((resolve, reject) => {
+      const tx = state.db.transaction(APP.libraryStoreName, 'readonly');
+      const req = tx.objectStore(APP.libraryStoreName).getAll();
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  function characterSlotsForLibrary(room) {
+    return (room?.slots || []).filter(s => s.group === 'character').map(s => ({
+      title: String(s.title || '캐릭터').trim() || '캐릭터',
+      aliases: Array.isArray(s.aliases) ? [...s.aliases] : [],
+      content: String(s.content || ''),
+      retentionTurns: normalizeRetentionTurns(s.retentionTurns),
+    }));
+  }
+
+  function libraryItemKey(item) {
+    return String(item?.title || '').trim().replace(/\s+/g, ' ').toLowerCase();
+  }
+
+  function mergeCharacterLibraryItems(existingItems, selectedItems, preserveUnselected = true) {
+    if (!preserveUnselected) return selectedItems.map(x => ({ ...x, aliases: [...(x.aliases || [])] }));
+    const result = (existingItems || []).map(x => ({ ...x, aliases: [...(x.aliases || [])] }));
+    const index = new Map(result.map((x, i) => [libraryItemKey(x), i]));
+    for (const item of selectedItems || []) {
+      const key = libraryItemKey(item);
+      const next = { ...item, aliases: [...(item.aliases || [])] };
+      if (key && index.has(key)) result[index.get(key)] = next;
+      else { index.set(key, result.length); result.push(next); }
+    }
+    return result;
+  }
+
+  function applySelectedCharacterLibraryToRoom(room, selectedItems) {
+    const chars = (room.slots || []).filter(s => s.group === 'character');
+    const byKey = new Map(chars.map(s => [libraryItemKey(s), s]));
+    let added = 0, updated = 0;
+    for (const src of selectedItems || []) {
+      const key = libraryItemKey(src);
+      let slot = key ? byKey.get(key) : null;
+      if (!slot) {
+        slot = makeDynamicSlot('character', String(src.title || '캐릭터'));
+        room.slots.push(slot);
+        byKey.set(key, slot);
+        added++;
+      } else { updated++; }
+      slot.title = String(src.title || '캐릭터');
+      slot.aliases = Array.isArray(src.aliases) ? [...src.aliases] : [];
+      slot.content = String(src.content || '');
+      slot.retentionTurns = normalizeRetentionTurns(src.retentionTurns);
+      slot.autoExcluded = !!slot.autoExcluded;
+      slot.enabled = false; // 불러온 항목은 현재 방에서 사용자가 직접 체크
+    }
+    normalizeRoomSlots(room);
+    return { count: (selectedItems || []).length, added, updated };
+  }
+
+  function extraSlotsForLibrary(room) {
+    return (room?.slots || [])
+      .filter(slot => slot.group === 'extra' && String(slot.content || '').trim())
+      .map(slot => {
+        if (!/^extra-item-[A-Za-z0-9_-]+$/.test(String(slot.libraryItemId || ''))) {
+          slot.libraryItemId = makeExtraLibraryItemId(`room-slot|${room?.chatId || ''}|${slot.id}`);
+        }
+        return {
+          itemId:String(slot.libraryItemId),
+          title:String(slot.title || '기타').trim() || '기타',
+          content:String(slot.content || ''),
+          retentionTurns:normalizeRetentionTurns(slot.retentionTurns),
+          category:String(slot.extraCategory || '').trim(),
+        };
+      });
+  }
+
+  function mergeExtraLibraryItems(existingItems, selectedItems, preserveUnselected = true) {
+    const legacyContainer = { scopeId:'merge', extras:(existingItems || []).map(item => ({ ...item })) };
+    ensureExtraLibraryItemIds(legacyContainer);
+    const selected = (selectedItems || []).map(item => ({ ...item }));
+    if (!preserveUnselected) return selected.map(item => ({ ...item, itemId:String(item.itemId || makeExtraLibraryItemId()) }));
+
+    const result = legacyContainer.extras;
+    const byId = new Map(result.map((item, index) => [String(item.itemId), index]));
+    const existingByTitle = new Map();
+    const existingBySignature = new Map();
+    const selectedTitleCounts = new Map();
+    for (const item of result) {
+      const key = libraryItemKey(item);
+      if (!existingByTitle.has(key)) existingByTitle.set(key, []);
+      existingByTitle.get(key).push(item);
+      const signature = `${key}\n${String(item.content || '')}`;
+      if (!existingBySignature.has(signature)) existingBySignature.set(signature, []);
+      existingBySignature.get(signature).push(item);
+    }
+    for (const item of selected) {
+      const key = libraryItemKey(item);
+      selectedTitleCounts.set(key, Number(selectedTitleCounts.get(key) || 0) + 1);
+    }
+
+    const consumedIndexes = new Set();
+    for (const item of selected) {
+      let itemId = String(item.itemId || '').trim();
+      let targetIndex = itemId ? byId.get(itemId) : undefined;
+      const titleKey = libraryItemKey(item);
+      const signature = `${titleKey}\n${String(item.content || '')}`;
+      if (targetIndex == null) {
+        const exact = (existingBySignature.get(signature) || []).find(candidate => !consumedIndexes.has(byId.get(String(candidate.itemId))));
+        if (exact) targetIndex = byId.get(String(exact.itemId));
+      }
+      // 구버전 항목은 같은 제목이 양쪽에 정확히 하나일 때만 기존 항목과 연결합니다.
+      if (targetIndex == null && titleKey && selectedTitleCounts.get(titleKey) === 1 && (existingByTitle.get(titleKey) || []).length === 1) {
+        const legacy = existingByTitle.get(titleKey)[0];
+        targetIndex = byId.get(String(legacy.itemId));
+      }
+      if (!itemId) itemId = makeExtraLibraryItemId();
+      const next = { ...item, itemId };
+      if (targetIndex != null) {
+        const oldId = String(result[targetIndex]?.itemId || '');
+        result[targetIndex] = next;
+        if (oldId !== itemId) byId.delete(oldId);
+        byId.set(itemId, targetIndex);
+        consumedIndexes.add(targetIndex);
+      }
+      else { byId.set(itemId, result.length); result.push(next); }
+    }
+    return result;
+  }
